@@ -9,8 +9,9 @@ import time
 import errno
 import traceback
 from concurrent.futures import ThreadPoolExecutor, Executor, as_completed
-from dataclasses import dataclass, asdict, FrozenInstanceError
+from dataclasses import dataclass, FrozenInstanceError, asdict
 from functools import partial
+from itertools import chain
 from typing import (
     Optional,
     Callable,
@@ -24,13 +25,16 @@ from typing import (
 )
 import json
 import tempfile
+import hashlib
 
-import dateutil
 import nltk
 import requests
-from dateutil.parser import parse
 
-DUMP_PAGE_URL = "https://dumps.wikimedia.org/enwiki/20200101/"
+DUMP_DATE = "20200101"
+DUMP_PAGE_URL = f"https://dumps.wikimedia.org/enwiki/{DUMP_DATE}/"
+MD5_HASHES = (
+    f"https://dumps.wikimedia.org/enwiki/{DUMP_DATE}/enwiki-{DUMP_DATE}-md5sums.txt"
+)
 DELETE = False  # if true, deletes intermediary files
 USE_LOCAL = True  # if true, get directory and prefer local files if they exist
 SENTENCE_SPLITTER = nltk.data.load("tokenizers/punkt/english.pickle")
@@ -77,13 +81,13 @@ def download_update_file(session: requests.Session, url: str) -> str:
 
 @dataclass(init=False, frozen=True)
 class Revision:
-    timestamp: datetime.datetime
+    timestamp: str
     text: str
     parent: Optional[str]
     id: str
 
     def __init__(self, timestamp: str, text: str, parent: Optional[str], id: str):
-        object.__setattr__(self, "timestamp", parse(timestamp))
+        object.__setattr__(self, "timestamp", timestamp)
         object.__setattr__(self, "text", text)
         object.__setattr__(self, "parent", int(parent) if parent else None)
         object.__setattr__(self, "id", int(id))
@@ -97,9 +101,7 @@ def test_revision():
     r = Revision("2002-02-25 15:51:15+00:00", "this is a text", None, "10")
 
     # test __init__
-    assert r.timestamp == datetime.datetime(
-        2002, 2, 25, 15, 51, 15, tzinfo=dateutil.tz.tzutc()
-    )
+    assert r.timestamp == "2002-02-25 15:51:15+00:00"
     assert r.text == "this is a text"
     assert r.parent is None
     assert r.id == 10
@@ -132,77 +134,118 @@ def generate_revisions(file) -> Generator[Revision, None, None]:
             element.clear()
 
 
+def extract_one_file(filename: str):
+    print(f"{strtime()} extracting revisions from update file {filename}... 🧛")
+    with bz2.open(filename, "rt", newline="") as uncompressed:
+        for revision in generate_revisions(uncompressed):
+            yield revision
+
+    print(f"{strtime()} exhausted file: {filename} 😴")
+    if DELETE:
+        print(f"{strtime()} Deleting {filename}... ✅")
+        os.remove(filename)
+
+
 def parse_downloads(
     download_file_and_url: Iterable[Tuple[str, str]],
     append_bad_urls,
     executor: Executor,
 ):
+    # perform checksum
     filenames, urls = lazy_dezip(download_file_and_url)
-    parsed_files_and_urls = zip(
-        lazy_executor_map(executor, consume_update_file, filenames), urls
+    filenames_and_urls = zip(
+        lazy_executor_map(
+            executor, check_hash, filenames, max_parallel=os.cpu_count() * 2
+        ),
+        urls,
     )
-    for happy_and_unhappy_files, url in parsed_files_and_urls:
-        if happy_and_unhappy_files:
-            yield happy_and_unhappy_files
+
+    # yield revisions for valid-checksum files
+    chunk_size = int((os.cpu_count() or 4) * 1.5)
+    files_to_process = []
+    for filename, url in filenames_and_urls:
+        if filename:
+            files_to_process.append(filename)
+            if len(files_to_process) == chunk_size:
+                for case in merge_generators(
+                    executor,
+                    (extract_one_file(filename) for filename in files_to_process),
+                ):
+                    yield case
+                files_to_process.clear()
         else:
             append_bad_urls.append(url)
+    for case in merge_generators(
+        executor, (extract_one_file(filename) for filename in files_to_process)
+    ):
+        yield case
 
 
-def consume_update_file(filename: str) -> Optional[Dict]:
-    happy_out = filename[:-4] + "_happy.csv.bz2"
-    unhappy_out = filename[:-4] + "_unhappy.csv.bz2"
-    try:
-        print(f"{strtime()} checking if processed files already exist... ⏪")
-        if all(os.path.exists(out_file) for out_file in [happy_out, unhappy_out]):
-            print(
-                f"{strtime()} returning premade output files: {happy_out, unhappy_out} 💅"
-            )
-            return {"happy": happy_out, "unhappy": unhappy_out}
-    except (EOFError, TypeError):
-        pass
-    try:
-        print(f"{strtime()} extracting revisions from update file {filename}... 🧛")
-        uncompressed = bz2.open(filename, "rt", newline="")
-        happy_csv = bz2.open(happy_out, "wt", newline="")
-        unhappy_csv = bz2.open(unhappy_out, "wt", newline="")
-
-        happy = csv.DictWriter(happy_csv, Revision.fields(), dialect="unix")
-        happy.writeheader()
-        unhappy = csv.DictWriter(unhappy_csv, Revision.fields(), dialect="unix")
-        unhappy.writeheader()
-        for revision in generate_revisions(uncompressed):
-            if revision.parent is None:
-                happy.writerow(asdict(revision))
+class VerifiedFilesRecord:
+    def __init__(self):
+        self.canonical_record = "canonical_hashes.txt"
+        while not os.path.exists(self.canonical_record):
+            resp = requests.get(MD5_HASHES)
+            if resp.status_code != 200:
+                print(
+                    f"{strtime()} unable to get md5 hashes from wikipedia. "
+                    "Sleeping for five minutes then retrying..."
+                )
+                time.sleep(5 * 60)
             else:
-                unhappy.writerow(asdict(revision))
+                with open(self.canonical_record, "w") as local_record:
+                    local_record.write(resp.text)
 
-        uncompressed.close()
-        if DELETE:
-            print(f"{strtime()} deleting {filename}. 🛀")
+        self.canonical_hashes = {
+            line.split("  ")[1].strip(): line.split("  ")[0]
+            for line in open(self.canonical_record).readlines()
+        }
+
+        self.record_in_storage = "verified_files_record.txt"
+        if os.path.exists(self.record_in_storage):
+            self.files = set(open(self.record_in_storage).readlines())
+        else:
+            open(self.record_in_storage, "a").close()
+            self.files = set()
+
+    def __contains__(self, filename):
+        return filename in self.files
+
+    def add(self, filename):
+        base = os.path.basename(filename)
+        with open(self.record_in_storage, "a") as store:
+            store.write(base + "\n")
+        self.files.add(base)
+
+    def canonical_hash(self, filename) -> str:
+        base = os.path.basename(filename)
+        return self.canonical_hashes[base]
+
+
+def get_hash(filename: str) -> str:
+    hash = hashlib.md5()
+    with open(filename, "rb") as f:
+        while True:
+            chunk = f.read(1000000)
+            if not chunk:
+                break
+            hash.update(chunk)
+    return hash.hexdigest()
+
+
+def check_hash(filename: str) -> Optional[Dict]:
+    verified_files = VerifiedFilesRecord()
+    if filename not in verified_files:
+        print(f"{strtime()} checking hash for {filename}... 📋")
+        hash = get_hash(filename)
+        if hash != verified_files.canonical_hash(filename):
+            print(f"{strtime()} Hash mismatch with {filename}. Deleting file.")
             os.remove(filename)
+            return None
+        elif not DELETE:
+            verified_files.add(filename)
 
-        happy_csv.close()
-        unhappy_csv.close()
-        return {"happy": happy_out, "unhappy": unhappy_out}
-    except EOFError:
-        print(f"{strtime()} EOF error with {filename}. Deleting partial file.")
-        for f in [happy_out, unhappy_out, filename]:
-            os.remove(f)
-        return None
-
-
-def get_cases(filename: str) -> Generator[Dict, None, None]:
-    try:
-        csv.field_size_limit(2147483647)  # largest signed long in C
-        with bz2.open(filename, "rt", newline="") as file:
-            for case in csv.DictReader(file, dialect="unix"):
-                yield case
-    except EOFError as eof:
-        print(
-            f"{strtime()} EOF error in get_cases from file: {filename}. Removing file & raising error."
-        )
-        os.remove(filename)
-        raise eof
+    return filename
 
 
 def diff(old: str, new: str) -> Generator[str, None, None]:
@@ -413,52 +456,40 @@ def test_diff():
             assert diffs[i] == correct_diffs[i]
 
 
-def unpack_one_unhappy_file(
-    unhappy_file, happy_hash, parents, map_parent_id_to_lost_kids
+def process_one_revision(
+    case: Revision, parents, map_parent_id_to_lost_kids
 ) -> Generator[Dict, None, None]:
-    print(f"{strtime()} dechaining {unhappy_file}...")
-    try:
-        for unhappy_case in get_cases(
-            unhappy_file
-        ):  # we are traversing in both directions (parent & kid).
-            found_parent = False
-            parent_id = unhappy_case["parent"]
-            id = unhappy_case["id"]
-            text = unhappy_case["text"]
-            if id in map_parent_id_to_lost_kids:
-                kid = map_parent_id_to_lost_kids.pop(id)
-                for text in diff(text, kid["text"]):
-                    yield {**unhappy_case, "text": text}
-                    # kid was found, but this text still doesn't have a known parent.
-            if parent_id in parents:
-                parent = parents.pop(parent_id)
-                parents[id] = unhappy_case
-                for text in diff(parent["text"], text):
-                    yield {**unhappy_case, "text": text}
-                    found_parent = True
-            for file, cases in happy_hash.items():
-                if parent_id in cases:
-                    parent = cases.pop(parent_id)
-                    yield parent
-                    for text in diff(parent["text"], text):
-                        yield {**unhappy_case, "text": text}
-                        found_parent = True
-                    parents[id] = unhappy_case
-            if not found_parent:
-                map_parent_id_to_lost_kids[unhappy_case["parent"]] = unhappy_case
-        print(f"{strtime()} exhausted file: {unhappy_file} 😴")
-        if DELETE:
-            print(f"{strtime()} Deleting {unhappy_file}... ✅")
-            os.remove(unhappy_file)
-    except EOFError as eof:
-        print(
-            f"{strtime()} EOF error while parsing {unhappy_file}. Deleting file and re-raising error."
-        )
-        os.remove(unhappy_file)
-        raise eof
+    unknown_parent = True
+    parent_id = case.parent
+    id = case.id
+    text = case.text
+    case_dict = asdict(case)
+    if parent_id is None:
+        unknown_parent = False
+        yield case_dict
+    elif id in map_parent_id_to_lost_kids:
+        kid = map_parent_id_to_lost_kids.pop(id)
+        for text in diff(text, kid["text"]):
+            yield {**case_dict, "text": text}
+            # kid was found, but this text still doesn't have a known parent.
+
+    if parent_id in parents:
+        parent = parents.pop(parent_id)
+        parents[id] = case
+        for text in diff(parent["text"], text):
+            yield {**case_dict, "text": text}
+            unknown_parent = False
+
+    if unknown_parent:
+        map_parent_id_to_lost_kids[case.parent] = case_dict
 
 
-def merge_generators(executor, generators):
+T = TypeVar("T")
+
+
+def merge_generators(
+    executor: Executor, generators: Iterable[Generator[T, None, None]]
+) -> Generator[T, None, None]:
     def wrap_next(generator):
         try:
             return (False, next(generator), generator)
@@ -494,7 +525,9 @@ def test_combine_generators():
         assert len(list(merge_generators(e, (gen1(), gen2())))) == 20
 
 
-def all_happy_cases(happy_hash, unhappy_files) -> Generator[Dict, None, None]:
+def all_happy_cases(
+    executor: Executor, revisions: Iterable[Revision]
+) -> Generator[Dict, None, None]:
     """
     notes: this function consumes its input. Its output is not ordered.
 
@@ -506,38 +539,33 @@ def all_happy_cases(happy_hash, unhappy_files) -> Generator[Dict, None, None]:
     print(f"{strtime()} de-chaining revisions... 🔗")
     chunk_size = int(
         os.cpu_count() * 1.5
-    )  # number of open unhappy files simultaneously processed
+    )  # max number of open revision files simultaneously processed
 
     with StorageDict() as parents:
         with StorageDict() as map_parent_id_to_lost_kids:
-            with ThreadPoolExecutor(max_workers=chunk_size) as executor:
-                generators = (
-                    unpack_one_unhappy_file(
-                        unhappy_file, happy_hash, parents, map_parent_id_to_lost_kids
-                    )
-                    for unhappy_file in unhappy_files
+            for intermediary_list in chain(
+                lazy_executor_map(
+                    executor,
+                    lambda tup: [v for v in process_one_revision(*tup)],
+                    (
+                        (revision, parents, map_parent_id_to_lost_kids)
+                        for revision in revisions
+                    ),
+                    max_parallel=chunk_size,
                 )
-                generator_chunk = (
-                    []
-                )  # collect chunk_size number of generators to run concurrently.
-                for generator in generators:
-                    generator_chunk.append(generator)
-                    if len(generator_chunk) == chunk_size:
-                        for new_happy_case in merge_generators(
-                            executor, generator_chunk
-                        ):
-                            yield new_happy_case
-                        generator_chunk.clear()
-                for new_happy_case in merge_generators(executor, generator_chunk):
-                    yield new_happy_case
+            ):
+                for case in intermediary_list:
+                    yield case
 
-    # account for happy childless revisions (pages that have never been edited)
-    for filename, happy_cases in happy_hash.items():
-        if len(happy_cases) > 0:
-            for happy_case in happy_cases.values():
-                yield happy_case
-
-    assert len(map_parent_id_to_lost_kids) == 0
+            if not len(map_parent_id_to_lost_kids) == 0:
+                orphans_out = "orphans_out.csv.bz2"
+                print(
+                    f"orphan revisions identified. Saving in a second output file: {orphans_out}"
+                )
+                with bz2.open(orphans_out, "wt", newline="") as output_file:
+                    writer = csv.DictWriter(output_file, Revision.fields())
+                    for _id, orphan_case in map_parent_id_to_lost_kids:
+                        writer.writerow(orphan_case)
 
 
 class LazyList:
@@ -801,6 +829,7 @@ class StorageDict:
         Basic concurrency is supported (added and deleting
         entries within unique threads). Multiple simultaneous edits on the same key are *not* currently supported–
         no lock is implemented.
+
     """
 
     keys_to_files: Dict
@@ -819,7 +848,10 @@ class StorageDict:
 
     def __setitem__(self, key, value):
         key_hash = hash(key)
-        subdir = os.path.join(self.directory.name, str(key_hash % self.num_subdirs))
+        subdir = os.path.join(
+            self.directory.name,
+            str(key_hash % self.num_subdirs)
+        )
         if not os.path.exists(subdir):
             os.mkdir(subdir)
         path = os.path.join(subdir, str(key_hash))
@@ -840,6 +872,10 @@ class StorageDict:
 
     def __repr__(self):
         return f"<StorageDict object at {id(self)} with {len(self.keys_to_files)} keys ({self.keys_to_files.keys()})>"
+
+    def __iter__(self):
+        for k in self.keys_to_files:
+            yield k, self[k]
 
     def pop(self, *args):
         k = args[0]
@@ -1043,7 +1079,7 @@ def test_lazy_dezip():
     assert "".join(hij) == "hij"
 
 
-def download_and_parse_files():
+def download_and_parse_files(executor: Executor) -> Generator[Revision, None, None]:
     # todo automatically find the last completed bz2 history job
     print(f"{strtime()} program started. 👋")
     print(f"{strtime()} requesting dump directory... 📚")
@@ -1059,7 +1095,7 @@ def download_and_parse_files():
     assert dump_page.status_code == 200
     print(f"{strtime()} parsing dump directory...  🗺️🗺️")
 
-    # read history links in dump summary
+    # read history file links in dump summary
     updates_urls = LazyList(
         map(
             lambda partial_url: "https://dumps.wikimedia.org" + partial_url,
@@ -1071,76 +1107,52 @@ def download_and_parse_files():
     )
 
     # download & process the history files
-    with ThreadPoolExecutor() as executor:
-        download_file_and_url = zip(
-            lazy_executor_map(
-                executor,
-                partial(download_update_file, session),
-                updates_urls,
-                max_parallel=2,
-            ),
+    file_and_url = zip(
+        lazy_executor_map(
+            executor,
+            partial(download_update_file, session),
             updates_urls,
-        )
-        sorted_files = list(
-            parse_downloads(
-                download_file_and_url, append_bad_urls=updates_urls, executor=executor
-            )
-        )  # collect names of processed files in list here so we can free up the pool resources
-
-    return sorted_files
-
-
-def unchain_and_collate_files(sorted_files):
-    # we now have "happy" cases (edits that don't include old text) and "unhappy" cases (edits with old and new
-    # text mixed together). We want to use the parent id to extract the old text, just leaving the new text.
-    happy_files, unhappy_files = lazy_dezip(
-        map(lambda case: (case["happy"], case["unhappy"]), sorted_files)
-    )
-    happy_hash = LazyDict(
-        map(
-            lambda happy_file: (
-                happy_file,
-                {case["id"]: case for case in get_cases(happy_file)},
-            ),
-            happy_files,
-        )
+            max_parallel=2,
+        ),
+        updates_urls,
     )
 
-    # we use these happy cases to build revision changes to remove preceding text and get just the changed text
-    # for a single revision.
+    for revision in parse_downloads(
+        file_and_url, append_bad_urls=updates_urls, executor=executor
+    ):
+        yield revision
+
+
+def write_diffs_from_revisions(executor: Executor, revisions: Iterable[Revision]):
     with bz2.open("revisions.csv.bz2", "wt", newline="") as output_file:
         writer = csv.DictWriter(output_file, Revision.fields())
 
         i = 0
-        for happy_case in all_happy_cases(happy_hash, unhappy_files):
-            writer.writerow(happy_case)
+        for case in all_happy_cases(executor, revisions):
+            writer.writerow(case)
             i += 1
             if i % 1000000 == 0 or i == 1:
                 print(f"{strtime()} writing revision #{i}")
-
-        if DELETE:
-            print(f'{strtime()} deleting intermediary "happy" files... 😊')
-            for file in happy_files:
-                os.remove(file)
 
     print(f"{strtime()} program complete. 💐")
 
 
 if __name__ == "__main__":
-    complete = False
-    while not complete:
-        try:
-            sorted_files = download_and_parse_files()
-            unchain_and_collate_files(sorted_files)
-            complete = True
-        except Exception as e:
-            if getattr(e, "errno", None) == errno.ENOSPC:
-                print(f"{strtime()} no space left on device. Ending program. 😲")
-                raise e
-            SLEEP_SECONDS = 5 * 60
-            print(traceback.format_exc())
-            print(
-                f"{strtime()} caught exception ({e}). Sleeping {SLEEP_SECONDS/60} minutes..."
-            )
-            time.sleep(SLEEP_SECONDS)
-            print(f"{strtime()} Restarting...")
+    with ThreadPoolExecutor() as executor:
+        complete = False
+        while not complete:
+            try:
+                revisions = download_and_parse_files(executor)
+                write_diffs_from_revisions(executor, revisions)
+                complete = True
+            except Exception as e:
+                if getattr(e, "errno", None) == errno.ENOSPC:
+                    print(f"{strtime()} no space left on device. Ending program. 😲")
+                    raise e
+                SLEEP_SECONDS = 5 * 60
+                print(traceback.format_exc())
+                print(
+                    f"{strtime()} caught exception ({e}). Sleeping {SLEEP_SECONDS/60} minutes..."
+                )
+                time.sleep(SLEEP_SECONDS)
+                print(f"{strtime()} Restarting...")
