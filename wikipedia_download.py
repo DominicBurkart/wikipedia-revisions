@@ -155,13 +155,13 @@ def parse_downloads(
     filenames, urls = lazy_dezip(download_file_and_url)
     filenames_and_urls = zip(
         lazy_executor_map(
-            executor, check_hash, filenames, max_parallel=os.cpu_count() * 2
+            executor, check_hash, filenames, max_parallel=os.cpu_count() * 3
         ),
         urls,
     )
 
     # yield revisions for valid-checksum files
-    chunk_size = int((os.cpu_count() or 4) * 1.5)
+    chunk_size = int((os.cpu_count() or 4) * 2)
     files_to_process = []
     for filename, url in filenames_and_urls:
         if filename:
