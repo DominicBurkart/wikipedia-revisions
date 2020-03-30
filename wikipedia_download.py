@@ -40,8 +40,9 @@ USE_LOCAL = True  # if true, get directory and prefer local files if they exist
 try:
     SENTENCE_SPLITTER = nltk.data.load("tokenizers/punkt/english.pickle")
 except LookupError:
-    nltk.download('punkt')
+    nltk.download("punkt")
     SENTENCE_SPLITTER = nltk.data.load("tokenizers/punkt/english.pickle")
+
 
 def strtime() -> str:
     return datetime.datetime.now().isoformat()
@@ -866,7 +867,9 @@ class StorageDict:
         return len(self.keys_to_files)
 
     def __repr__(self):
-        return f"<StorageDict object at {id(self)} with {len(self.keys_to_files)} entries>"
+        return (
+            f"<StorageDict object at {id(self)} with {len(self.keys_to_files)} entries>"
+        )
 
     def __iter__(self):
         for k in self.keys_to_files:
