@@ -88,7 +88,7 @@ class Revision:
         self, timestamp: str, text: str, parent: Optional[str], id: str
     ):
         object.__setattr__(self, "timestamp", timestamp)
-        object.__setattr__(self, "text", text)
+        object.__setattr__(self, "text", text or "")
         object.__setattr__(self, "parent", int(parent) if parent else None)
         object.__setattr__(self, "id", int(id))
 
@@ -476,29 +476,24 @@ def test_diff():
 def process_one_revision(
     case: Revision, parents, map_parent_id_to_lost_kids
 ) -> Generator[Dict, None, None]:
-    unknown_parent = True
     parent_id = case.parent
     id = case.id
     text = case.text
     case_dict = asdict(case)
     if parent_id is None:
-        unknown_parent = False
         yield case_dict
-    elif id in map_parent_id_to_lost_kids:
-        kid = map_parent_id_to_lost_kids.pop(id)
-        for text in diff(text, kid["text"]):
-            yield {**case_dict, "text": text}
-            # kid was found, but this text still doesn't have a known parent.
-
-    if parent_id in parents:
+    elif parent_id in parents:
         parent = parents.pop(parent_id)
         parents[id] = case
         for text in diff(parent["text"], text):
             yield {**case_dict, "text": text}
-            unknown_parent = False
+    else:
+        map_parent_id_to_lost_kids[parent_id] = case_dict
 
-    if unknown_parent:
-        map_parent_id_to_lost_kids[case.parent] = case_dict
+    if id in map_parent_id_to_lost_kids:
+        kid = map_parent_id_to_lost_kids.pop(id)
+        for text in diff(text, kid["text"]):
+            yield {**case_dict, "text": text}
 
 
 T = TypeVar("T")
@@ -875,23 +870,22 @@ class StorageDict:
         if not os.path.exists(subdir):
             os.mkdir(subdir)
         path = os.path.join(subdir, str(key_hash))
-        self.keys_to_files[key] = path
         with bz2.open(path, "wt") as f:
             json.dump(value, f)
+        self.keys_to_files[key] = path
 
     def __contains__(self, item):
         return item in self.keys_to_files
 
     def __delitem__(self, key):
-        path = self.keys_to_files[key]
+        path = self.keys_to_files.pop(key)
         os.remove(path)
-        del self.keys_to_files[key]
 
     def __len__(self):
         return len(self.keys_to_files)
 
     def __repr__(self):
-        return f"<StorageDict object at {id(self)} with {len(self.keys_to_files)} keys ({self.keys_to_files.keys()})>"
+        return f"<StorageDict object at {id(self)} with {len(self.keys_to_files)} entries>"
 
     def __iter__(self):
         for k in self.keys_to_files:
