@@ -37,8 +37,11 @@ MD5_HASHES = (
 )
 DELETE = False  # if true, deletes intermediary files
 USE_LOCAL = True  # if true, get directory and prefer local files if they exist
-SENTENCE_SPLITTER = nltk.data.load("tokenizers/punkt/english.pickle")
-
+try:
+    SENTENCE_SPLITTER = nltk.data.load("tokenizers/punkt/english.pickle")
+except LookupError:
+    nltk.download('punkt')
+    SENTENCE_SPLITTER = nltk.data.load("tokenizers/punkt/english.pickle")
 
 def strtime() -> str:
     return datetime.datetime.now().isoformat()
