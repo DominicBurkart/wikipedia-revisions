@@ -165,7 +165,7 @@ def parse_downloads(
     )
 
     # yield revisions for valid-checksum files
-    chunk_size = int((os.cpu_count() or 4) * 2)
+    chunk_size = int((os.cpu_count() or 4) * 1.5)
     files_to_process = []
     for filename, url in filenames_and_urls:
         if filename:
@@ -174,13 +174,14 @@ def parse_downloads(
                 for case in merge_generators(
                     executor,
                     (extract_one_file(filename) for filename in files_to_process),
+                    10000
                 ):
                     yield case
                 files_to_process.clear()
         else:
             append_bad_urls.append(url)
     for case in merge_generators(
-        executor, (extract_one_file(filename) for filename in files_to_process)
+        executor, (extract_one_file(filename) for filename in files_to_process), 10000
     ):
         yield case
 
@@ -488,30 +489,34 @@ T = TypeVar("T")
 
 
 def merge_generators(
-    executor: Executor, generators: Iterable[Generator[T, None, None]]
+    executor: Executor, generators: Iterable[Generator[T, None, None]], chunksize: int=1
 ) -> Generator[T, None, None]:
-    def wrap_next(generator):
-        try:
-            return (False, next(generator), generator)
-        except StopIteration:
-            return (True, None, None)
+    if chunksize < 1:
+        raise ValueError("chunksize must be ≥ 1")
 
-    first_future_wave = [
+    def wrap_next(generator):
+        output = []
+        for value in generator:
+            output.append(value)
+            if len(output) == chunksize:
+                return False, output, generator
+        return True, output, None
+
+    running_generators = [
         executor.submit(wrap_next, generator) for generator in generators
     ]
-    second_future_wave = []
-    while len(first_future_wave) > 0 or len(second_future_wave) > 0:
-        for future in as_completed(first_future_wave):
-            (is_exhausted, value, generator) = future.result()
+    while len(running_generators) > 0:
+        incomplete = []
+        for future in as_completed(running_generators):
+            (is_exhausted, values, generator) = future.result()
             if not is_exhausted:
-                yield value
-                second_future_wave.append(executor.submit(wrap_next, generator))
+                for value in values:
+                    yield value
+                incomplete.append(executor.submit(wrap_next, generator))
+        running_generators = incomplete
 
-        first_future_wave = second_future_wave
-        second_future_wave = []
 
-
-def test_combine_generators():
+def test_merge_generators():
     def gen1():
         for x in range(10):
             yield x
@@ -537,12 +542,10 @@ def all_happy_cases(
     to retain multiple revisions of articles until the intermediary ones have been found.
     """
     print(f"{strtime()} de-chaining revisions... 🔗")
-    chunk_size = int(
-        os.cpu_count() * 1.5
-    )  # max number of open revision files simultaneously processed
+    chunk_size = int(os.cpu_count() * 1.5)
 
-    with StorageDict() as parents:
-        with StorageDict() as map_parent_id_to_lost_kids:
+    with StorageDict() as map_parent_id_to_lost_kids:
+        with StorageDict() as parents:
             for intermediary_list in chain(
                 lazy_executor_map(
                     executor,
@@ -557,15 +560,15 @@ def all_happy_cases(
                 for case in intermediary_list:
                     yield case
 
-            if not len(map_parent_id_to_lost_kids) == 0:
-                orphans_out = "orphans_out.csv.bz2"
-                print(
-                    f"orphan revisions identified. Saving in a second output file: {orphans_out}"
-                )
-                with bz2.open(orphans_out, "wt", newline="") as output_file:
-                    writer = csv.DictWriter(output_file, Revision.fields())
-                    for _id, orphan_case in map_parent_id_to_lost_kids:
-                        writer.writerow(orphan_case)
+        if not len(map_parent_id_to_lost_kids) == 0:
+            orphans_out = "orphans_out.csv.bz2"
+            print(
+                f"orphan revisions identified. Saving in a second output file: {orphans_out}"
+            )
+            with bz2.open(orphans_out, "wt", newline="") as output_file:
+                writer = csv.DictWriter(output_file, Revision.fields())
+                for _id, orphan_case in map_parent_id_to_lost_kids:
+                    writer.writerow(orphan_case)
 
 
 class LazyList:
@@ -841,16 +844,25 @@ class StorageDict:
         self.directory = tempfile.TemporaryDirectory(dir=path)
         self.num_subdirs = num_subdirs
 
-    def __getitem__(self, item):
-        path = self.keys_to_files[item]  # throws KeyError if key not found.
+    def _read_path(self, path):
         with bz2.open(path, "rt") as f:
             return json.load(f)
 
+    def __getitem__(self, item):
+        path = self.keys_to_files[item]  # throws KeyError if key not found.
+        return self._read_path(path)
+
     def __setitem__(self, key, value):
         key_hash = hash(key)
-        subdir = os.path.join(self.directory.name, str(key_hash % self.num_subdirs))
+        subdir = os.path.join(
+            self.directory.name,
+            str(key_hash % self.num_subdirs)
+        )
         if not os.path.exists(subdir):
-            os.mkdir(subdir)
+            try:
+                os.mkdir(subdir)
+            except FileExistsError:
+                pass
         path = os.path.join(subdir, str(key_hash))
         with bz2.open(path, "wt") as f:
             json.dump(value, f)
@@ -877,18 +889,18 @@ class StorageDict:
 
     def pop(self, *args):
         k = args[0]
-        if k in self:
-            value = self[k]
-            del self[k]
-            return value
-        elif len(args) == 1:
-            raise KeyError
-        elif len(args) == 2:
-            return args[1]
-        else:
-            raise TypeError(
-                f"pop takes one or two arguments. {len(args)} arguments passed."
-            )
+        try:
+            path = self.keys_to_files.pop(k)
+            return self._read_path(path)
+        except KeyError:
+            if len(args) == 1:
+                raise KeyError
+            elif len(args) == 2:
+                return args[1]
+            else:
+                raise TypeError(
+                    f"pop takes one or two arguments. {len(args)} arguments passed."
+                )
 
     def close(self):
         self.directory.cleanup()
