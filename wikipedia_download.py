@@ -32,9 +32,7 @@ import requests
 
 DUMP_DATE = "20200101"
 DUMP_PAGE_URL = f"https://dumps.wikimedia.org/enwiki/{DUMP_DATE}/"
-MD5_HASHES = (
-    f"https://dumps.wikimedia.org/enwiki/{DUMP_DATE}/enwiki-{DUMP_DATE}-md5sums.txt"
-)
+MD5_HASHES = f"https://dumps.wikimedia.org/enwiki/{DUMP_DATE}/enwiki-{DUMP_DATE}-md5sums.txt"
 DELETE = False  # if true, deletes intermediary files
 USE_LOCAL = True  # if true, get directory and prefer local files if they exist
 try:
@@ -90,7 +88,9 @@ class Revision:
     parent: Optional[str]
     id: str
 
-    def __init__(self, timestamp: str, text: str, parent: Optional[str], id: str):
+    def __init__(
+        self, timestamp: str, text: str, parent: Optional[str], id: str
+    ):
         object.__setattr__(self, "timestamp", timestamp)
         object.__setattr__(self, "text", text or "")
         object.__setattr__(self, "parent", int(parent) if parent else None)
@@ -173,15 +173,20 @@ def parse_downloads(
             if len(files_to_process) == chunk_size:
                 for case in merge_generators(
                     executor,
-                    (extract_one_file(filename) for filename in files_to_process),
-                    10000
+                    (
+                        extract_one_file(filename)
+                        for filename in files_to_process
+                    ),
+                    10000,
                 ):
                     yield case
                 files_to_process.clear()
         else:
             append_bad_urls.append(url)
     for case in merge_generators(
-        executor, (extract_one_file(filename) for filename in files_to_process), 10000
+        executor,
+        (extract_one_file(filename) for filename in files_to_process),
+        10000,
     ):
         yield case
 
@@ -260,7 +265,8 @@ def diff(old: str, new: str) -> Generator[str, None, None]:
     def preceding_sentence_end(pretty_diff, i):
         for i2 in range(i - 1, 0, -1):
             if (
-                pretty_diff[i2] in " +" and pretty_diff[i2][1] in END_PUNCTUATION
+                pretty_diff[i2] in " +"
+                and pretty_diff[i2][1] in END_PUNCTUATION
             ):  # todo check for ellipsis here
                 return i2 + 1
         return 0
@@ -288,13 +294,15 @@ def diff(old: str, new: str) -> Generator[str, None, None]:
                 parsed_to_diff_mapping[parsed_start],
                 parsed_to_diff_mapping.get(parsed_end, len(pretty_diff)),
             )
-            for (parsed_start, parsed_end) in SENTENCE_SPLITTER.span_tokenize(parsed)
+            for (parsed_start, parsed_end) in SENTENCE_SPLITTER.span_tokenize(
+                parsed
+            )
         )
 
     def range_includes_added_or_edited_section(diff_range):
-        return any(diff_item[0] in "-+" for diff_item in diff_range) and not all(
-            diff_item[0] == "-" for diff_item in diff_range
-        )
+        return any(
+            diff_item[0] in "-+" for diff_item in diff_range
+        ) and not all(diff_item[0] == "-" for diff_item in diff_range)
 
     pretty_diff = list(
         filter(
@@ -305,7 +313,9 @@ def diff(old: str, new: str) -> Generator[str, None, None]:
         )
     )
     sentences_update_mapping = {
-        (starti, endi): range_includes_added_or_edited_section(pretty_diff[starti:endi])
+        (starti, endi): range_includes_added_or_edited_section(
+            pretty_diff[starti:endi]
+        )
         for starti, endi in sentence_ranges(pretty_diff)
     }
     sorted_sentence_ranges = sorted(sentences_update_mapping.keys())
@@ -317,7 +327,9 @@ def diff(old: str, new: str) -> Generator[str, None, None]:
 
             # if multiple consecutive sentences are updated or added, include them in the window.
             for window_end in range(window_start, len(sorted_sentence_ranges)):
-                if not sentences_update_mapping[sorted_sentence_ranges[window_end]]:
+                if not sentences_update_mapping[
+                    sorted_sentence_ranges[window_end]
+                ]:
                     window_end -= 1
                     break
 
@@ -351,11 +363,17 @@ def test_diff():
         ),
         "creation": (
             ["it was a dark and stormy night. A second sentence. A third."],
-            ("", "it was a dark and stormy night. A second sentence. A third."),
+            (
+                "",
+                "it was a dark and stormy night. A second sentence. A third.",
+            ),
         ),
         "deletion": (
             [],
-            ("it was a dark and stormy night. A second sentence. A third.", ""),
+            (
+                "it was a dark and stormy night. A second sentence. A third.",
+                "",
+            ),
         ),
         "first sentence: one word change": (
             ["it was a light and stormy day."],
@@ -489,7 +507,9 @@ T = TypeVar("T")
 
 
 def merge_generators(
-    executor: Executor, generators: Iterable[Generator[T, None, None]], chunksize: int=1
+    executor: Executor,
+    generators: Iterable[Generator[T, None, None]],
+    chunksize: int = 1,
 ) -> Generator[T, None, None]:
     if chunksize < 1:
         raise ValueError("chunksize must be ≥ 1")
@@ -793,7 +813,9 @@ def test_lazy_dict_pop():
     except KeyError:
         pass
     else:
-        raise RuntimeError("pop() should error when given a bad key and no default")
+        raise RuntimeError(
+            "pop() should error when given a bad key and no default"
+        )
 
     d = LazyDict([(0, "nice")])
     v = d.pop(0)
@@ -855,8 +877,7 @@ class StorageDict:
     def __setitem__(self, key, value):
         key_hash = hash(key)
         subdir = os.path.join(
-            self.directory.name,
-            str(key_hash % self.num_subdirs)
+            self.directory.name, str(key_hash % self.num_subdirs)
         )
         if not os.path.exists(subdir):
             try:
@@ -879,9 +900,7 @@ class StorageDict:
         return len(self.keys_to_files)
 
     def __repr__(self):
-        return (
-            f"<StorageDict object at {id(self)} with {len(self.keys_to_files)} entries>"
-        )
+        return f"<StorageDict object at {id(self)} with {len(self.keys_to_files)} entries>"
 
     def __iter__(self):
         for k in self.keys_to_files:
@@ -968,7 +987,9 @@ def test_multithreading():
         with StorageDict() as d:
             with ThreadPoolExecutor(max_workers=num_workers) as executor:
                 list(executor.map(lambda i: add_value(d, i), range(10)))
-                print(f"test add value: num workers: {num_workers} storage dict: {d}")
+                print(
+                    f"test add value: num workers: {num_workers} storage dict: {d}"
+                )
                 for i in range(10):
                     assert d[i] == i
                 list(executor.map(lambda i: delete_value(d, i), range(10)))
@@ -996,7 +1017,9 @@ def test_with_lazy_executor_map():
                         max_parallel=num_workers,
                     )
                 )
-                print(f"test add value: num workers: {num_workers} storage dict: {d}")
+                print(
+                    f"test add value: num workers: {num_workers} storage dict: {d}"
+                )
                 for i in range(10):
                     assert d[i] == i
 
@@ -1045,20 +1068,28 @@ def lazy_executor_map(
     try:
         while True:
             while len(futures) < max_parallel:
-                futures.append(executor.submit(function, next(function_inputs_iter)))
+                futures.append(
+                    executor.submit(function, next(function_inputs_iter))
+                )
             old_futures = futures
             futures = []
             for future_i in range(len(old_futures)):
                 yield old_futures[future_i].result()
-                num_current_tasks = len(old_futures) - (future_i + 1) + len(futures)
+                num_current_tasks = (
+                    len(old_futures) - (future_i + 1) + len(futures)
+                )
                 if num_current_tasks < max_parallel:
                     # start next task immediately, unless we're at max_parallel open jobs.
                     try:
                         futures.append(
-                            executor.submit(function, next(function_inputs_iter))
+                            executor.submit(
+                                function, next(function_inputs_iter)
+                            )
                         )
                     except StopIteration as stop:  # no new tasks! clean up old_futures and then re-raise StopIteration.
-                        for remaining_i in range(future_i + 1, len(old_futures)):
+                        for remaining_i in range(
+                            future_i + 1, len(old_futures)
+                        ):
                             yield old_futures[remaining_i].result()
                         raise stop
     except StopIteration:
@@ -1089,7 +1120,9 @@ def test_lazy_dezip():
     assert "".join(hij) == "hij"
 
 
-def download_and_parse_files(executor: Executor) -> Generator[Revision, None, None]:
+def download_and_parse_files(
+    executor: Executor
+) -> Generator[Revision, None, None]:
     # todo automatically find the last completed bz2 history job
     print(f"{strtime()} program started. 👋")
     print(f"{strtime()} requesting dump directory... 📚")
@@ -1112,7 +1145,8 @@ def download_and_parse_files(executor: Executor) -> Generator[Revision, None, No
         map(
             lambda partial_url: "https://dumps.wikimedia.org" + partial_url,
             filter(
-                lambda url: "pages-meta-history" in url and url.endswith(".bz2"),
+                lambda url: "pages-meta-history" in url
+                and url.endswith(".bz2"),
                 re.findall('href="(.+?)"', dump_page.text),
             ),
         )
@@ -1135,7 +1169,9 @@ def download_and_parse_files(executor: Executor) -> Generator[Revision, None, No
         yield revision
 
 
-def write_diffs_from_revisions(executor: Executor, revisions: Iterable[Revision]):
+def write_diffs_from_revisions(
+    executor: Executor, revisions: Iterable[Revision]
+):
     with bz2.open("revisions.csv.bz2", "wt", newline="") as output_file:
         writer = csv.DictWriter(output_file, Revision.fields())
 
@@ -1159,7 +1195,9 @@ if __name__ == "__main__":
                 complete = True
             except Exception as e:
                 if getattr(e, "errno", None) == errno.ENOSPC:
-                    print(f"{strtime()} no space left on device. Ending program. 😲")
+                    print(
+                        f"{strtime()} no space left on device. Ending program. 😲"
+                    )
                     raise e
                 SLEEP_SECONDS = 5 * 60
                 print(traceback.format_exc())
