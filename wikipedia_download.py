@@ -178,12 +178,12 @@ def parse_downloads(
                         extract_one_file(filename)
                         for filename in files_to_process
                     ),
-                    10000,
+                    10000, # read many revisions sequentially to avoid needle moving cost
                 ):
                     yield case
                 files_to_process.clear()
         else:
-            append_bad_urls.append(url)
+            append_bad_urls.append(url) # if checksum fails, add bad file to retry file
     for case in merge_generators(
         executor,
         (extract_one_file(filename) for filename in files_to_process),
@@ -193,6 +193,11 @@ def parse_downloads(
 
 
 class VerifiedFilesRecord:
+    """
+    retain the hash and basename for each downloaded file. downloads the
+    canonical hashes from wikipedia if they are not stored locally.
+    """
+
     def __init__(self):
         self.canonical_record = "canonical_hashes.txt"
         while not os.path.exists(self.canonical_record):
@@ -727,60 +732,60 @@ class StorageDict:
         self.keys_to_files = dict()
         self.directory = tempfile.TemporaryDirectory(dir=path)
         self.num_subdirs = num_subdirs
-        self.lock = threading.Lock()
+        self.key_lock = threading.Lock()
 
     def _read_path(self, path):
         with bz2.open(path, "rt") as f:
             return json.load(f)
 
     def __getitem__(self, item):
-        with self.lock:
+        with self.key_lock:
             path = self.keys_to_files[item]  # throws KeyError if key not found.
-            return self._read_path(path)
+        return self._read_path(path)
 
     def __setitem__(self, key, value):
-        with self.lock:
-            key_hash = hash(key)
-            subdir = os.path.join(
-                self.directory.name, str(key_hash % self.num_subdirs)
-            )
-            if not os.path.exists(subdir):
-                try:
-                    os.mkdir(subdir)
-                except FileExistsError:
-                    pass
-            path = os.path.join(subdir, str(key_hash))
-            with bz2.open(path, "wt") as f:
-                json.dump(value, f)
+        key_hash = hash(key)
+        subdir = os.path.join(
+            self.directory.name, str(key_hash % self.num_subdirs)
+        )
+        if not os.path.exists(subdir):
+            try:
+                os.mkdir(subdir)
+            except FileExistsError:
+                pass
+        path = os.path.join(subdir, str(key_hash))
+        with bz2.open(path, "wt") as f:
+            json.dump(value, f)
+        with self.key_lock:
             self.keys_to_files[key] = path
 
     def __contains__(self, item):
-        with self.lock:
+        with self.key_lock:
             return item in self.keys_to_files
 
     def __delitem__(self, key):
-        with self.lock:
+        with self.key_lock:
             path = self.keys_to_files.pop(key)
-            os.remove(path)
+        os.remove(path)
 
     def __len__(self):
-        with self.lock:
+        with self.key_lock:
             return len(self.keys_to_files)
 
     def __repr__(self):
-        with self.lock:
+        with self.key_lock:
             return f"<StorageDict object at {id(self)} with {len(self.keys_to_files)} entries>"
 
     def __iter__(self):
-        with self.lock:
+        with self.key_lock:
             for k in self.keys_to_files:
                 yield k, self[k]
 
     def pop(self, *args):
         try:
-            with self.lock:
+            with self.key_lock:
                 path = self.keys_to_files.pop(args[0])
-                return self._read_path(path)
+            return self._read_path(path)
         except KeyError:
             if len(args) == 1:
                 raise KeyError
