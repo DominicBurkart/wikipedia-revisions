@@ -26,6 +26,7 @@ from typing import (
 import json
 import tempfile
 import hashlib
+import threading
 
 import nltk
 import requests
@@ -484,21 +485,21 @@ def process_one_revision(
     case: Revision, parents, map_parent_id_to_lost_kids
 ) -> Generator[Dict, None, None]:
     parent_id = case.parent
+    parent = parents.pop(parent_id, None) if parent_id else None
     id = case.id
     text = case.text
     case_dict = asdict(case)
     if parent_id is None:
         yield case_dict
-    elif parent_id in parents:
-        parent = parents.pop(parent_id)
+    elif parent:
         parents[id] = case
         for text in diff(parent["text"], text):
             yield {**case_dict, "text": text}
     else:
         map_parent_id_to_lost_kids[parent_id] = case_dict
 
-    if id in map_parent_id_to_lost_kids:
-        kid = map_parent_id_to_lost_kids.pop(id)
+    kid = map_parent_id_to_lost_kids.pop(id, None)
+    if kid:
         for text in diff(text, kid["text"]):
             yield {**case_dict, "text": text}
 
@@ -865,52 +866,60 @@ class StorageDict:
         self.keys_to_files = dict()
         self.directory = tempfile.TemporaryDirectory(dir=path)
         self.num_subdirs = num_subdirs
+        self.lock = threading.Lock()
 
     def _read_path(self, path):
         with bz2.open(path, "rt") as f:
             return json.load(f)
 
     def __getitem__(self, item):
-        path = self.keys_to_files[item]  # throws KeyError if key not found.
-        return self._read_path(path)
+        with self.lock:
+            path = self.keys_to_files[item]  # throws KeyError if key not found.
+            return self._read_path(path)
 
     def __setitem__(self, key, value):
-        key_hash = hash(key)
-        subdir = os.path.join(
-            self.directory.name, str(key_hash % self.num_subdirs)
-        )
-        if not os.path.exists(subdir):
-            try:
-                os.mkdir(subdir)
-            except FileExistsError:
-                pass
-        path = os.path.join(subdir, str(key_hash))
-        with bz2.open(path, "wt") as f:
-            json.dump(value, f)
-        self.keys_to_files[key] = path
+        with self.lock:
+            key_hash = hash(key)
+            subdir = os.path.join(
+                self.directory.name, str(key_hash % self.num_subdirs)
+            )
+            if not os.path.exists(subdir):
+                try:
+                    os.mkdir(subdir)
+                except FileExistsError:
+                    pass
+            path = os.path.join(subdir, str(key_hash))
+            with bz2.open(path, "wt") as f:
+                json.dump(value, f)
+            self.keys_to_files[key] = path
 
     def __contains__(self, item):
-        return item in self.keys_to_files
+        with self.lock:
+            return item in self.keys_to_files
 
     def __delitem__(self, key):
-        path = self.keys_to_files.pop(key)
-        os.remove(path)
+        with self.lock:
+            path = self.keys_to_files.pop(key)
+            os.remove(path)
 
     def __len__(self):
-        return len(self.keys_to_files)
+        with self.lock:
+            return len(self.keys_to_files)
 
     def __repr__(self):
-        return f"<StorageDict object at {id(self)} with {len(self.keys_to_files)} entries>"
+        with self.lock:
+            return f"<StorageDict object at {id(self)} with {len(self.keys_to_files)} entries>"
 
     def __iter__(self):
-        for k in self.keys_to_files:
-            yield k, self[k]
+        with self.lock:
+            for k in self.keys_to_files:
+                yield k, self[k]
 
     def pop(self, *args):
-        k = args[0]
         try:
-            path = self.keys_to_files.pop(k)
-            return self._read_path(path)
+            with self.lock:
+                path = self.keys_to_files.pop(args[0])
+                return self._read_path(path)
         except KeyError:
             if len(args) == 1:
                 raise KeyError
