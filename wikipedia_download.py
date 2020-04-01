@@ -490,7 +490,7 @@ def test_diff():
 
 def process_one_revision(
     case: Revision, parents, map_parent_id_to_lost_kids
-) -> Generator[Dict, None, None]:
+) -> List[Dict]:
     parent_id = int(case.parent) if case.parent else None
     parent = parents.pop(parent_id, None) if parent_id else None
     id = int(case.id)
@@ -500,15 +500,13 @@ def process_one_revision(
         yield case_dict
     elif parent:
         parents[id] = case
-        for text in diff(parent["text"], text):
-            yield {**case_dict, "text": text}
+        return [{**case_dict, "text": text} for text in diff(parent["text"], text)]
     else:
         map_parent_id_to_lost_kids[parent_id] = case_dict
 
     kid = map_parent_id_to_lost_kids.pop(id, None)
     if kid:
-        for text in diff(text, kid["text"]):
-            yield {**case_dict, "text": text}
+        return [{**case_dict, "text": text} for text in diff(text, kid["text"])]
 
 
 T = TypeVar("T")
@@ -596,7 +594,7 @@ def all_happy_cases(
             for intermediary_list in chain(
                 lazy_executor_map(
                     executor,
-                    lambda tup: [v for v in process_one_revision(*tup)],
+                    lambda tup: process_one_revision(*tup),
                     (
                         (revision, parents, map_parent_id_to_lost_kids)
                         for revision in revisions
