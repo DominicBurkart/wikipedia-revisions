@@ -491,9 +491,9 @@ def test_diff():
 def process_one_revision(
     case: Revision, parents, map_parent_id_to_lost_kids
 ) -> Generator[Dict, None, None]:
-    parent_id = case.parent
+    parent_id = int(case.parent) if case.parent else None
     parent = parents.pop(parent_id, None) if parent_id else None
-    id = case.id
+    id = int(case.id)
     text = case.text
     case_dict = asdict(case)
     if parent_id is None:
