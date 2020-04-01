@@ -489,24 +489,23 @@ def test_diff():
 
 
 def process_one_revision(
-    case: Revision, parents, map_parent_id_to_lost_kids
+    case: Dict, parents, map_parent_id_to_lost_kids
 ) -> List[Dict]:
-    parent_id = int(case.parent) if case.parent else None
+    parent_id = int(case["parent"]) if "parent" in case else None
     parent = parents.pop(parent_id, None) if parent_id else None
-    id = int(case.id)
-    text = case.text
-    case_dict = asdict(case)
+    id = int(case["id"])
+    text = case["text"]
     if parent_id is None:
-        yield case_dict
+        return [case]
     elif parent:
         parents[id] = case
-        return [{**case_dict, "text": text} for text in diff(parent["text"], text)]
+        return [{**case, "text": text} for text in diff(parent["text"], text)]
     else:
-        map_parent_id_to_lost_kids[parent_id] = case_dict
+        map_parent_id_to_lost_kids[parent_id] = case
 
     kid = map_parent_id_to_lost_kids.pop(id, None)
     if kid:
-        return [{**case_dict, "text": text} for text in diff(text, kid["text"])]
+        return [{**case, "text": text} for text in diff(text, kid["text"])]
 
 
 T = TypeVar("T")
@@ -596,7 +595,7 @@ def all_happy_cases(
                     executor,
                     lambda tup: process_one_revision(*tup),
                     (
-                        (revision, parents, map_parent_id_to_lost_kids)
+                        (asdict(revision), parents, map_parent_id_to_lost_kids)
                         for revision in revisions
                     ),
                     max_parallel=chunk_size,
@@ -604,6 +603,9 @@ def all_happy_cases(
             ):
                 for case in intermediary_list:
                     yield case
+
+            for _id, orphan_case in map_parent_id_to_lost_kids:
+                process_one_revision(orphan_case, parents, map_parent_id_to_lost_kids)
 
         if not len(map_parent_id_to_lost_kids) == 0:
             orphans_out = "orphans_out.csv.bz2"
