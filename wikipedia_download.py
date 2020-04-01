@@ -178,12 +178,14 @@ def parse_downloads(
                         extract_one_file(filename)
                         for filename in files_to_process
                     ),
-                    10000, # read many revisions sequentially to avoid needle moving cost
+                    10000,  # read many revisions sequentially to avoid needle moving cost
                 ):
                     yield case
                 files_to_process.clear()
         else:
-            append_bad_urls.append(url) # if checksum fails, add bad file to retry file
+            append_bad_urls.append(
+                url
+            )  # if checksum fails, add bad file to retry file
     for case in merge_generators(
         executor,
         (extract_one_file(filename) for filename in files_to_process),
@@ -759,7 +761,9 @@ class StorageDict:
 
     def __getitem__(self, item):
         with self.key_lock:
-            path = self.keys_to_files[item]  # throws KeyError if key not found.
+            path = self.keys_to_files[
+                item
+            ]  # throws KeyError if key not found.
         return self._read_path(path)
 
     def __setitem__(self, key, value):
