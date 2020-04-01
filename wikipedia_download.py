@@ -221,7 +221,7 @@ class VerifiedFilesRecord:
 
         self.record_in_storage = "verified_files_record.txt"
         if os.path.exists(self.record_in_storage):
-            self.files = set(open(self.record_in_storage).readlines())
+            self.files = set(map(lambda s: s.strip(), open(self.record_in_storage).readlines()))
         else:
             open(self.record_in_storage, "a").close()
             self.files = set()
