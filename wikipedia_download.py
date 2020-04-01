@@ -515,21 +515,40 @@ T = TypeVar("T")
 def merge_generators(
     executor: Executor,
     generators: Iterable[Generator[T, None, None]],
-    chunksize: int = 1,
+    batchsize: int = 1,
 ) -> Generator[T, None, None]:
-    if chunksize < 1:
+    """
+    Combines the output of multiple generators into a single generator. Uses a `concurrent.futures.Executor` to
+    concurrently exhaust input generators. Since regular generators cannot be polled concurrently,
+    the number of concurrent tasks submitted by this function is at most the number of generators.
+    Output order is not guaranteed.
+
+    If the output of this function is not exhausted, each input generators may be polled up to batchsize times
+    without the results being returned.
+
+    Larger batchsize values are especially useful when dealing with generators that return quickly.
+
+    The number of input generators is considered finite and reasonably small.
+
+    :param executor: executor in which generators are run.
+    :param generators: generators to combine results from.
+    :param batchsize: number of batches polled from each generator sequentially. Default is 1.
+    :return: a generator over the combined outputs of all input generators.
+    """
+
+    if batchsize < 1:
         raise ValueError("chunksize must be ≥ 1")
 
-    def wrap_next(generator):
+    def next_chunk(generator):
         output = []
         for value in generator:
             output.append(value)
-            if len(output) == chunksize:
+            if len(output) == batchsize:
                 return False, output, generator
         return True, output, None
 
     running_generators = [
-        executor.submit(wrap_next, generator) for generator in generators
+        executor.submit(next_chunk, generator) for generator in generators
     ]
     while len(running_generators) > 0:
         incomplete = []
@@ -538,7 +557,7 @@ def merge_generators(
             if not is_exhausted:
                 for value in values:
                     yield value
-                incomplete.append(executor.submit(wrap_next, generator))
+                incomplete.append(executor.submit(next_chunk, generator))
         running_generators = incomplete
 
 
