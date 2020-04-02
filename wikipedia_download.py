@@ -11,7 +11,6 @@ import traceback
 from concurrent.futures import ThreadPoolExecutor, Executor, as_completed
 from dataclasses import dataclass, FrozenInstanceError, asdict
 from functools import partial
-from itertools import chain
 from typing import (
     Optional,
     Callable,
@@ -19,7 +18,6 @@ from typing import (
     Generator,
     Iterable,
     List,
-    Iterator,
     Tuple,
     TypeVar,
     Any
@@ -28,7 +26,6 @@ import json
 import tempfile
 import hashlib
 import threading
-from random import choice
 
 import nltk
 import requests
