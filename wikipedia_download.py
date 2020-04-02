@@ -22,11 +22,13 @@ from typing import (
     Iterator,
     Tuple,
     TypeVar,
+    Any
 )
 import json
 import tempfile
 import hashlib
 import threading
+from random import choice
 
 import nltk
 import requests
@@ -150,7 +152,6 @@ def extract_one_file(filename: str):
         print(f"{strtime()} Deleting {filename}... ✅")
         os.remove(filename)
 
-
 def parse_downloads(
     download_file_and_url: Iterable[Tuple[str, str]],
     append_bad_urls,
@@ -166,7 +167,7 @@ def parse_downloads(
     )
 
     # yield revisions for valid-checksum files
-    chunk_size = int((os.cpu_count() or 4) * 1.5)
+    chunk_size = int((os.cpu_count() or 4) * 3)
     files_to_process = []
     for filename, url in filenames_and_urls:
         if filename:
@@ -178,7 +179,7 @@ def parse_downloads(
                         extract_one_file(filename)
                         for filename in files_to_process
                     ),
-                    10000,  # read many revisions sequentially to avoid needle moving cost
+                    10,  # read some revisions sequentially to avoid needle moving cost
                 ):
                     yield case
                 files_to_process.clear()
@@ -189,7 +190,7 @@ def parse_downloads(
     for case in merge_generators(
         executor,
         (extract_one_file(filename) for filename in files_to_process),
-        10000,
+        100,
     ):
         yield case
 
@@ -491,7 +492,8 @@ def test_diff():
 def process_one_revision(
     case: Dict, parents, map_parent_id_to_lost_kids
 ) -> List[Dict]:
-    parent_id = int(case["parent"]) if "parent" in case else None
+    _parent_id = case.get("parent", None)
+    parent_id = int(_parent_id) if _parent_id else None
     parent = parents.pop(parent_id, None) if parent_id else None
     id = int(case["id"])
     text = case["text"]
@@ -501,11 +503,13 @@ def process_one_revision(
         parents[id] = case
         return [{**case, "text": text} for text in diff(parent["text"], text)]
     else:
-        map_parent_id_to_lost_kids[parent_id] = case
+        if parent_id not in map_parent_id_to_lost_kids:
+            map_parent_id_to_lost_kids[parent_id] = case
 
     kid = map_parent_id_to_lost_kids.pop(id, None)
     if kid:
         return [{**case, "text": text} for text in diff(text, kid["text"])]
+    return []
 
 
 T = TypeVar("T")
@@ -553,9 +557,9 @@ def merge_generators(
         incomplete = []
         for future in as_completed(running_generators):
             (is_exhausted, values, generator) = future.result()
+            for value in values:
+                yield value
             if not is_exhausted:
-                for value in values:
-                    yield value
                 incomplete.append(executor.submit(next_chunk, generator))
         running_generators = incomplete
 
@@ -573,6 +577,15 @@ def test_merge_generators():
         assert set(merge_generators(e, (gen1(), gen2()))) == set(range(20))
         assert len(list(merge_generators(e, (gen1(), gen2())))) == 20
 
+def rescan(executor, map_parent_id_to_lost_kids, parents) -> Generator[Dict, None, None]:
+    orphan_cases = list(map_parent_id_to_lost_kids.values())
+    orphan_tups = (
+        (orphan_case, parents, map_parent_id_to_lost_kids)
+        for orphan_case in orphan_cases
+    )
+    complete_cases = [case for il in executor.map(lambda tup: process_one_revision(*tup), orphan_tups) for case in il]
+    print(f"rescanned found: {complete_cases} n cases: {len(orphan_cases)}")
+    return complete_cases
 
 def all_happy_cases(
     executor: Executor, revisions: Iterable[Revision]
@@ -586,36 +599,46 @@ def all_happy_cases(
     to retain multiple revisions of articles until the intermediary ones have been found.
     """
     print(f"{strtime()} de-chaining revisions... 🔗")
-    chunk_size = int(os.cpu_count() * 1.5)
+    chunk_size = (os.cpu_count() or 4) * 20
+    rescan_after = 100
 
-    with StorageDict() as map_parent_id_to_lost_kids:
-        with StorageDict() as parents:
-            for intermediary_list in chain(
-                lazy_executor_map(
-                    executor,
-                    lambda tup: process_one_revision(*tup),
-                    (
-                        (asdict(revision), parents, map_parent_id_to_lost_kids)
-                        for revision in revisions
-                    ),
-                    max_parallel=chunk_size,
+    revisions_handled = 0
+    map_parent_id_to_lost_kids = dict()
+    parents = dict()
+    rescan_futures = []
+    # with StorageDict() as map_parent_id_to_lost_kids:
+    #     with StorageDict() as parents:
+    for intermediary_list in lazy_executor_map(
+        executor,
+        lambda tup: process_one_revision(asdict(tup[0]), tup[1], tup[2]),
+        (
+            (revision, parents, map_parent_id_to_lost_kids)
+            for revision in revisions
+        ),
+        max_parallel=chunk_size,
+    ):
+        for case in intermediary_list:
+            yield case
+        revisions_handled += 1
+        if revisions_handled % rescan_after == 0:
+            if len(rescan_futures) < 0.9 ** len(map_parent_id_to_lost_kids):
+                rescan_futures.append(
+                    executor.submit(lambda tup: rescan(*tup), (executor, map_parent_id_to_lost_kids, parents))
                 )
-            ):
-                for case in intermediary_list:
-                    yield case
+            else:
+                for future in as_completed(rescan_futures):
+                    for case in future.result():
+                        yield case
 
-            for _id, orphan_case in map_parent_id_to_lost_kids:
-                process_one_revision(orphan_case, parents, map_parent_id_to_lost_kids)
-
-        if not len(map_parent_id_to_lost_kids) == 0:
-            orphans_out = "orphans_out.csv.bz2"
-            print(
-                f"orphan revisions identified. Saving in a second output file: {orphans_out}"
-            )
-            with bz2.open(orphans_out, "wt", newline="") as output_file:
-                writer = csv.DictWriter(output_file, Revision.fields())
-                for _id, orphan_case in map_parent_id_to_lost_kids:
-                    writer.writerow(orphan_case)
+    if not len(map_parent_id_to_lost_kids) == 0:
+        orphans_out = "orphans_out.csv.bz2"
+        print(
+            f"orphan revisions identified. Saving in a second output file: {orphans_out}"
+        )
+        with bz2.open(orphans_out, "wt", newline="") as output_file:
+            writer = csv.DictWriter(output_file, Revision.fields())
+            for _id, orphan_case in map_parent_id_to_lost_kids.items():
+                writer.writerow(orphan_case)
 
 
 class LazyList:
@@ -749,10 +772,11 @@ class StorageDict:
     directory: tempfile.TemporaryDirectory
     num_subdirs: int
 
-    def __init__(self, path=".", num_subdirs=1000):
-        self.keys_to_files = dict()
+    def __init__(self, path=".", num_subdirs:int =1000, memory_cap: int=0):
+        self.keys_to_files: Dict[Any, Tuple(str, threading.Lock)] = dict()
         self.directory = tempfile.TemporaryDirectory(dir=path)
         self.num_subdirs = num_subdirs
+        self.memory_cap = memory_cap
         self.key_lock = threading.Lock()
 
     def _read_path(self, path):
@@ -761,26 +785,38 @@ class StorageDict:
 
     def __getitem__(self, item):
         with self.key_lock:
-            path = self.keys_to_files[
+            path, file_lock = self.keys_to_files[
                 item
             ]  # throws KeyError if key not found.
-        return self._read_path(path)
+        with file_lock:
+            try:
+                return self._read_path(path)
+            except EOFError:
+                raise KeyError # entry deleted
 
     def __setitem__(self, key, value):
-        key_hash = hash(key)
-        subdir = os.path.join(
-            self.directory.name, str(key_hash % self.num_subdirs)
-        )
-        if not os.path.exists(subdir):
-            try:
-                os.mkdir(subdir)
-            except FileExistsError:
-                pass
-        path = os.path.join(subdir, str(key_hash))
-        with bz2.open(path, "wt") as f:
-            json.dump(value, f)
         with self.key_lock:
-            self.keys_to_files[key] = path
+            if key in self.keys_to_files:
+                path, file_lock = self.keys_to_files[key]
+                with file_lock:
+                    with bz2.open(path, "wt") as f:
+                        json.dump(value, f)
+                self.keys_to_files[key] = path, file_lock
+                return
+            else:
+                key_hash = hash(key)
+                subdir = os.path.join(
+                    self.directory.name, str(key_hash % self.num_subdirs)
+                )
+                if not os.path.exists(subdir):
+                    try:
+                        os.mkdir(subdir)
+                    except FileExistsError:
+                        pass
+                path = os.path.join(subdir, str(key_hash))
+                with bz2.open(path, "wt") as f:
+                    json.dump(value, f)
+                self.keys_to_files[key] = path, threading.Lock()
 
     def __contains__(self, item):
         with self.key_lock:
@@ -788,8 +824,9 @@ class StorageDict:
 
     def __delitem__(self, key):
         with self.key_lock:
-            path = self.keys_to_files.pop(key)
-        os.remove(path)
+            path, file_lock = self.keys_to_files.pop(key)
+        with file_lock:
+            os.remove(path)
 
     def __len__(self):
         with self.key_lock:
@@ -799,16 +836,25 @@ class StorageDict:
         with self.key_lock:
             return f"<StorageDict object at {id(self)} with {len(self.keys_to_files)} entries>"
 
-    def __iter__(self):
+    def items(self):
         with self.key_lock:
             for k in self.keys_to_files:
-                yield k, self[k]
+                path, file_lock = self.keys_to_files[k]
+                with file_lock:
+                    try:
+                        yield k, self._read_path(path)
+                    except EOFError:
+                        pass
 
     def pop(self, *args):
         try:
             with self.key_lock:
-                path = self.keys_to_files.pop(args[0])
-            return self._read_path(path)
+                path, file_lock = self.keys_to_files.pop(args[0])
+            with file_lock:
+                try:
+                    return self._read_path(path)
+                except EOFError:
+                    raise KeyError # entry deleted
         except KeyError:
             if len(args) == 1:
                 raise KeyError
@@ -960,40 +1006,16 @@ def lazy_executor_map(
             f"max_parallel is not greater than or equal to one: {max_parallel}"
         )
 
-    function_inputs_iter = iter(function_inputs)
-    futures = []
-
-    try:
-        while True:
-            while len(futures) < max_parallel:
-                futures.append(
-                    executor.submit(function, next(function_inputs_iter))
-                )
-            old_futures = futures
-            futures = []
-            for future_i in range(len(old_futures)):
-                yield old_futures[future_i].result()
-                num_current_tasks = (
-                    len(old_futures) - (future_i + 1) + len(futures)
-                )
-                if num_current_tasks < max_parallel:
-                    # start next task immediately, unless we're at max_parallel open jobs.
-                    try:
-                        futures.append(
-                            executor.submit(
-                                function, next(function_inputs_iter)
-                            )
-                        )
-                    except StopIteration as stop:  # no new tasks! clean up old_futures and then re-raise StopIteration.
-                        for remaining_i in range(
-                            future_i + 1, len(old_futures)
-                        ):
-                            yield old_futures[remaining_i].result()
-                        raise stop
-    except StopIteration:
-        pass
-    for future in futures:
-        yield future.result()
+    chunk = []
+    for inp in function_inputs:
+        chunk.append(inp)
+        if len(chunk) == max_parallel:
+            for v in executor.map(function, chunk):
+                yield v
+            chunk = []
+    if len(chunk) > 0:
+        for v in executor.map(function, chunk):
+            yield v
 
 
 def lazy_dezip(it: Iterable[Tuple]) -> Iterable[Iterable]:
@@ -1077,14 +1099,14 @@ def write_diffs_from_revisions(
         for case in all_happy_cases(executor, revisions):
             writer.writerow(case)
             i += 1
-            if i % 1000000 == 0 or i == 1:
+            if i % 1000 == 0 or i == 1:
                 print(f"{strtime()} writing revision #{i}")
 
     print(f"{strtime()} program complete. 💐")
 
 
 if __name__ == "__main__":
-    with ThreadPoolExecutor() as executor:
+    with ThreadPoolExecutor(max_workers=os.cpu_count() * 20) as executor:
         complete = False
         while not complete:
             try:
