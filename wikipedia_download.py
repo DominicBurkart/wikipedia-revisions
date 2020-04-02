@@ -584,7 +584,7 @@ def rescan(executor, map_parent_id_to_lost_kids, parents) -> Generator[Dict, Non
         for orphan_case in orphan_cases
     )
     complete_cases = [case for il in executor.map(lambda tup: process_one_revision(*tup), orphan_tups) for case in il]
-    print(f"rescanned found: {complete_cases} n cases: {len(orphan_cases)}")
+    print(f"rescan found: {len(complete_cases)} n cases: {len(orphan_cases)}")
     return complete_cases
 
 def all_happy_cases(
@@ -600,12 +600,13 @@ def all_happy_cases(
     """
     print(f"{strtime()} de-chaining revisions... 🔗")
     chunk_size = (os.cpu_count() or 4) * 20
-    rescan_after = 100
+    rescan_after = 500
 
     revisions_handled = 0
-    map_parent_id_to_lost_kids = dict()
-    parents = dict()
     rescan_futures = []
+
+    parents = dict()
+    map_parent_id_to_lost_kids = dict()
     # with StorageDict() as map_parent_id_to_lost_kids:
     #     with StorageDict() as parents:
     for intermediary_list in lazy_executor_map(
@@ -621,7 +622,7 @@ def all_happy_cases(
             yield case
         revisions_handled += 1
         if revisions_handled % rescan_after == 0:
-            if len(rescan_futures) < 0.9 ** len(map_parent_id_to_lost_kids):
+            if len(rescan_futures) < 3:
                 rescan_futures.append(
                     executor.submit(lambda tup: rescan(*tup), (executor, map_parent_id_to_lost_kids, parents))
                 )
@@ -629,6 +630,7 @@ def all_happy_cases(
                 for future in as_completed(rescan_futures):
                     for case in future.result():
                         yield case
+                rescan_futures = []
 
     if not len(map_parent_id_to_lost_kids) == 0:
         orphans_out = "orphans_out.csv.bz2"
