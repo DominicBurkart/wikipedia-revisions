@@ -20,7 +20,7 @@ from typing import (
     List,
     Tuple,
     TypeVar,
-    Any
+    Any,
 )
 import json
 import tempfile
@@ -149,6 +149,7 @@ def extract_one_file(filename: str):
         print(f"{strtime()} Deleting {filename}... ✅")
         os.remove(filename)
 
+
 def parse_downloads(
     download_file_and_url: Iterable[Tuple[str, str]],
     append_bad_urls,
@@ -219,7 +220,12 @@ class VerifiedFilesRecord:
 
         self.record_in_storage = "verified_files_record.txt"
         if os.path.exists(self.record_in_storage):
-            self.files = set(map(lambda s: s.strip(), open(self.record_in_storage).readlines()))
+            self.files = set(
+                map(
+                    lambda s: s.strip(),
+                    open(self.record_in_storage).readlines(),
+                )
+            )
         else:
             open(self.record_in_storage, "a").close()
             self.files = set()
@@ -574,15 +580,25 @@ def test_merge_generators():
         assert set(merge_generators(e, (gen1(), gen2()))) == set(range(20))
         assert len(list(merge_generators(e, (gen1(), gen2())))) == 20
 
-def rescan(executor, map_parent_id_to_lost_kids, parents) -> Generator[Dict, None, None]:
+
+def rescan(
+    executor, map_parent_id_to_lost_kids, parents
+) -> Generator[Dict, None, None]:
     orphan_cases = list(map_parent_id_to_lost_kids.values())
     orphan_tups = (
         (orphan_case, parents, map_parent_id_to_lost_kids)
         for orphan_case in orphan_cases
     )
-    complete_cases = [case for il in executor.map(lambda tup: process_one_revision(*tup), orphan_tups) for case in il]
+    complete_cases = [
+        case
+        for il in executor.map(
+            lambda tup: process_one_revision(*tup), orphan_tups
+        )
+        for case in il
+    ]
     print(f"rescan found: {len(complete_cases)} n cases: {len(orphan_cases)}")
     return complete_cases
+
 
 def all_happy_cases(
     executor: Executor, revisions: Iterable[Revision]
@@ -621,7 +637,10 @@ def all_happy_cases(
         if revisions_handled % rescan_after == 0:
             if len(rescan_futures) < 3:
                 rescan_futures.append(
-                    executor.submit(lambda tup: rescan(*tup), (executor, map_parent_id_to_lost_kids, parents))
+                    executor.submit(
+                        lambda tup: rescan(*tup),
+                        (executor, map_parent_id_to_lost_kids, parents),
+                    )
                 )
             else:
                 for future in as_completed(rescan_futures):
@@ -771,7 +790,7 @@ class StorageDict:
     directory: tempfile.TemporaryDirectory
     num_subdirs: int
 
-    def __init__(self, path=".", num_subdirs:int =1000, memory_cap: int=0):
+    def __init__(self, path=".", num_subdirs: int = 1000, memory_cap: int = 0):
         self.keys_to_files: Dict[Any, Tuple(str, threading.Lock)] = dict()
         self.directory = tempfile.TemporaryDirectory(dir=path)
         self.num_subdirs = num_subdirs
@@ -791,7 +810,7 @@ class StorageDict:
             try:
                 return self._read_path(path)
             except EOFError:
-                raise KeyError # entry deleted
+                raise KeyError  # entry deleted
 
     def __setitem__(self, key, value):
         with self.key_lock:
@@ -853,7 +872,7 @@ class StorageDict:
                 try:
                     return self._read_path(path)
                 except EOFError:
-                    raise KeyError # entry deleted
+                    raise KeyError  # entry deleted
         except KeyError:
             if len(args) == 1:
                 raise KeyError
