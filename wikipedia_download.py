@@ -1,17 +1,15 @@
 import bz2
 import csv
 import datetime
-import difflib
 import os
 import re
 import xml.etree.ElementTree as ET
 import time
 import errno
 import traceback
-from concurrent.futures import ThreadPoolExecutor, Executor, as_completed
+from concurrent.futures import ThreadPoolExecutor, Executor, Future
 from dataclasses import dataclass, FrozenInstanceError, asdict
 from functools import partial
-from itertools import chain
 from typing import (
     Optional,
     Callable,
@@ -19,16 +17,15 @@ from typing import (
     Generator,
     Iterable,
     List,
-    Iterator,
     Tuple,
     TypeVar,
+    Any,
 )
 import json
 import tempfile
 import hashlib
 import threading
 
-import nltk
 import requests
 
 DUMP_DATE = "20200101"
@@ -36,11 +33,6 @@ DUMP_PAGE_URL = f"https://dumps.wikimedia.org/enwiki/{DUMP_DATE}/"
 MD5_HASHES = f"https://dumps.wikimedia.org/enwiki/{DUMP_DATE}/enwiki-{DUMP_DATE}-md5sums.txt"
 DELETE = False  # if true, deletes intermediary files
 USE_LOCAL = True  # if true, get directory and prefer local files if they exist
-try:
-    SENTENCE_SPLITTER = nltk.data.load("tokenizers/punkt/english.pickle")
-except LookupError:
-    nltk.download("punkt")
-    SENTENCE_SPLITTER = nltk.data.load("tokenizers/punkt/english.pickle")
 
 
 def strtime() -> str:
@@ -139,11 +131,11 @@ def generate_revisions(file) -> Generator[Revision, None, None]:
             element.clear()
 
 
-def extract_one_file(filename: str):
+def extract_one_file(filename: str) -> Dict:
     print(f"{strtime()} extracting revisions from update file {filename}... 🧛")
     with bz2.open(filename, "rt", newline="") as uncompressed:
         for revision in generate_revisions(uncompressed):
-            yield revision
+            yield asdict(revision)
 
     print(f"{strtime()} exhausted file: {filename} 😴")
     if DELETE:
@@ -160,13 +152,16 @@ def parse_downloads(
     filenames, urls = lazy_dezip(download_file_and_url)
     filenames_and_urls = zip(
         lazy_executor_map(
-            executor, check_hash, filenames, max_parallel=os.cpu_count() * 3
+            executor,
+            partial(check_hash, VerifiedFilesRecord()),
+            filenames,
+            max_parallel=os.cpu_count() * 3,
         ),
         urls,
     )
 
     # yield revisions for valid-checksum files
-    chunk_size = int((os.cpu_count() or 4) * 1.5)
+    chunk_size = int((os.cpu_count() or 4) * 5)
     files_to_process = []
     for filename, url in filenames_and_urls:
         if filename:
@@ -178,7 +173,6 @@ def parse_downloads(
                         extract_one_file(filename)
                         for filename in files_to_process
                     ),
-                    10000,  # read many revisions sequentially to avoid needle moving cost
                 ):
                     yield case
                 files_to_process.clear()
@@ -187,9 +181,7 @@ def parse_downloads(
                 url
             )  # if checksum fails, add bad file to retry file
     for case in merge_generators(
-        executor,
-        (extract_one_file(filename) for filename in files_to_process),
-        10000,
+        executor, (extract_one_file(filename) for filename in files_to_process)
     ):
         yield case
 
@@ -221,7 +213,12 @@ class VerifiedFilesRecord:
 
         self.record_in_storage = "verified_files_record.txt"
         if os.path.exists(self.record_in_storage):
-            self.files = set(open(self.record_in_storage).readlines())
+            self.files = set(
+                map(
+                    lambda s: s.strip(),
+                    open(self.record_in_storage).readlines(),
+                )
+            )
         else:
             open(self.record_in_storage, "a").close()
             self.files = set()
@@ -251,8 +248,9 @@ def get_hash(filename: str) -> str:
     return hash.hexdigest()
 
 
-def check_hash(filename: str) -> Optional[Dict]:
-    verified_files = VerifiedFilesRecord()
+def check_hash(
+    verified_files: VerifiedFilesRecord, filename: str
+) -> Optional[Dict]:
     if filename not in verified_files:
         print(f"{strtime()} checking hash for {filename}... 📋")
         hash = get_hash(filename)
@@ -266,301 +264,127 @@ def check_hash(filename: str) -> Optional[Dict]:
     return filename
 
 
-def diff(old: str, new: str) -> Generator[str, None, None]:
-    END_PUNCTUATION = ".!?"
-    JUNK_CHUNKS = {"", *END_PUNCTUATION}
+class _Waiter:
+    """
+        based on _Waiter class in concurrent.futures._base
+    """
 
-    def preceding_sentence_end(pretty_diff, i):
-        for i2 in range(i - 1, 0, -1):
-            if (
-                pretty_diff[i2] in " +"
-                and pretty_diff[i2][1] in END_PUNCTUATION
-            ):  # todo check for ellipsis here
-                return i2 + 1
-        return 0
+    def __init__(self):
+        self.event = threading.Event()
+        self.finished_futures = []
+        self.lock = threading.Lock()
+        self.n_pending: int = 0
 
-    def parse_range(pretty_diff, r):
-        return "".join(
-            pretty_diff[i][1]
-            for i in r
-            if pretty_diff[i][0] in " +"  # don't include "-" (removed values)
-        )
+    def add_result(self, future):
+        with self.lock:
+            self.finished_futures.append(future)
+            self.n_pending -= 1
+        self.event.set()
 
-    def map_parsed_to_diff(pretty_diff):
-        parsed_to_diff_indices = {}
-        parsed_list = []
-        for diff_index in range(len(pretty_diff)):
-            if pretty_diff[diff_index][0] in " +":
-                parsed_to_diff_indices[len(parsed_list)] = diff_index
-                parsed_list.append(pretty_diff[diff_index][1])
-        return "".join(parsed_list), parsed_to_diff_indices
+    def add_exception(self, future):
+        with self.lock:
+            self.finished_futures.append(future)
+            self.n_pending -= 1
+        self.event.set()
 
-    def sentence_ranges(pretty_diff) -> Iterable[Tuple[int, int]]:
-        parsed, parsed_to_diff_mapping = map_parsed_to_diff(pretty_diff)
-        return (
-            (
-                parsed_to_diff_mapping[parsed_start],
-                parsed_to_diff_mapping.get(parsed_end, len(pretty_diff)),
-            )
-            for (parsed_start, parsed_end) in SENTENCE_SPLITTER.span_tokenize(
-                parsed
-            )
-        )
+    def add_cancelled(self, future):
+        with self.lock:
+            self.finished_futures.append(future)
+            self.n_pending -= 1
+        self.event.set()
 
-    def range_includes_added_or_edited_section(diff_range):
-        return any(
-            diff_item[0] in "-+" for diff_item in diff_range
-        ) and not all(diff_item[0] == "-" for diff_item in diff_range)
 
-    pretty_diff = list(
-        filter(
-            lambda ds: not any(
-                ["+++" in ds, "---" in ds, "@@" in ds]
-            ),  # diff string headers (not useful for us)
-            difflib.unified_diff(old, new, n=max(len(old), len(new))),
-        )
-    )
-    sentences_update_mapping = {
-        (starti, endi): range_includes_added_or_edited_section(
-            pretty_diff[starti:endi]
-        )
-        for starti, endi in sentence_ranges(pretty_diff)
-    }
-    sorted_sentence_ranges = sorted(sentences_update_mapping.keys())
-    window_start = 0
-    while window_start < len(sorted_sentence_ranges):
-        # check if the current window starts with a changed or added sentence.
-        if sentences_update_mapping[sorted_sentence_ranges[window_start]]:
-            # if the current window starts with a changed or added sentence, set the window end.
+class Awaiter:
+    """
+        works like concurrent.futures.as_completed, but accepts additional futures during iteration.
+        output ordering is arbitrary.
+    """
 
-            # if multiple consecutive sentences are updated or added, include them in the window.
-            for window_end in range(window_start, len(sorted_sentence_ranges)):
-                if not sentences_update_mapping[
-                    sorted_sentence_ranges[window_end]
-                ]:
-                    window_end -= 1
-                    break
+    def __init__(self, iterable: Iterable[Future]):
+        self._waiter = _Waiter()
+        self.prior_completed = set()
+        for future in iterable:
+            self.add(future)
 
-            # find the text contained in the window.
-            parsed = parse_range(
-                pretty_diff,
-                range(
-                    sorted_sentence_ranges[window_start][0],
-                    sorted_sentence_ranges[window_end][1],
-                ),
+    def add(self, future: Future):
+        with future._condition:
+            if future.done():
+                self.prior_completed.add(future)
+            else:
+                future._waiters.append(self._waiter)
+                with self._waiter.lock:
+                    self._waiter.n_pending += 1
+
+    def as_completed(self) -> Generator[Any, None, None]:
+        while not self.done():
+            while len(self.prior_completed) > 0:
+                yield self.prior_completed.pop().result()
+            self._waiter.event.wait()
+            with self._waiter.lock:
+                finished = self._waiter.finished_futures
+                self._waiter.finished_futures = []
+                self._waiter.event.clear()
+            while len(finished) > 0:
+                # assigning the future to a variable will
+                # break the generator. See
+                # concurrent.futures._base._yield_finished_futures
+                with finished[-1]._condition:
+                    finished[-1]._waiters.remove(self._waiter)
+                    result = finished[-1].result()
+                del finished[-1]
+                yield result
+
+    def done(self) -> bool:
+        with self._waiter.lock:
+            return (
+                self._waiter.n_pending == 0 and len(self.prior_completed) == 0
             )
 
-            # if the text contains actual content, yield it.
-            if parsed.strip() not in JUNK_CHUNKS:
-                yield parsed
 
-            # advance the window and loop.
-            window_start = max(window_end + 1, window_start + 1)
-        else:
-            window_start += 1
-
-
-def test_diff():
-    diff_maps = {
-        "no diff": (
-            [],
-            (
-                "it was a dark and stormy night. A second sentence. A third.",
-                "it was a dark and stormy night. A second sentence. A third.",
-            ),
-        ),
-        "creation": (
-            ["it was a dark and stormy night. A second sentence. A third."],
-            (
-                "",
-                "it was a dark and stormy night. A second sentence. A third.",
-            ),
-        ),
-        "deletion": (
-            [],
-            (
-                "it was a dark and stormy night. A second sentence. A third.",
-                "",
-            ),
-        ),
-        "first sentence: one word change": (
-            ["it was a light and stormy day."],
-            (
-                "it was a dark and stormy day. A second sentence. A third.",
-                "it was a light and stormy day. A second sentence. A third.",
-            ),
-        ),
-        "first sentence: two non-continuous words changed in same sentence": (
-            ["it was a light and bright day."],
-            (
-                "it was a dark and stormy night. A second sentence. A third.",
-                "it was a light and bright day. A second sentence. A third.",
-            ),
-        ),
-        "middle sentence changed": (
-            ["Another sentence."],
-            (
-                "it was a dark and stormy night. A second sentence. A third.",
-                "it was a dark and stormy night. Another sentence. A third.",
-            ),
-        ),
-        "last sentence changed": (
-            ["A fourth."],
-            (
-                "it was a dark and stormy night. A second sentence. A third.",
-                "it was a dark and stormy night. A second sentence. A fourth.",
-            ),
-        ),
-        "two continuous sentences changed": (
-            ["Another sentence. A fourth."],
-            (
-                "it was a dark and stormy night. A second sentence. A third.",
-                "it was a dark and stormy night. Another sentence. A fourth.",
-            ),
-        ),
-        "two non-continuous sentences changed": (
-            ["it was a light and bright day.", "A fourth."],
-            (
-                "it was a dark and stormy night. A second sentence. A third.",
-                "it was a light and bright day. A second sentence.  A fourth.",
-            ),
-        ),
-        "sentence prepended": (
-            ["A fourth."],
-            (
-                "it was a dark and stormy night. A second sentence. A third.",
-                "A fourth. it was a dark and stormy night. A second sentence. A third.",
-            ),
-        ),
-        "sentence imputed": (
-            ["And a fourth."],
-            (
-                "it was a dark and stormy night. A second sentence. Then, a third.",
-                "it was a dark and stormy night. A second sentence. And a fourth. Then, a third.",
-            ),
-        ),
-        "sentence appended": (
-            ["And a fourth."],
-            (
-                "it was a dark and stormy night. A second sentence. A third.",
-                "it was a dark and stormy night. A second sentence. A third. And a fourth.",
-            ),
-        ),
-        "sentence prepended, imputed, and appended": (
-            [
-                "The fourth sentence is prepended.",
-                "another fourth sentence is imputed.",
-                "A final fourth appends itself.",
-            ],
-            (
-                "it was a dark and stormy night. A second sentence. A third.",
-                "The fourth sentence is prepended. it was a dark and stormy night. another "
-                "fourth sentence is imputed. A second sentence. A third. A final fourth appends itself.",
-            ),
-        ),
-        "special case: ellipses (...)": (
-            ["A single sentence was changed... with an ellipsis!"],
-            (
-                "A sentence. A single sentence was changed... I don't know which one, though!",
-                "A sentence. A single sentence was changed... with an ellipsis!",
-            ),
-        ),
-        "special case: abbreviations": (
-            ["The President of the U.S., J.F.K, is here."],
-            (
-                "The President of the US, J.F.K, is here.",
-                "The President of the U.S., J.F.K, is here.",
-            ),
-        ),
-        "special case: filename with dot (hello_world.py)": (
-            ["The file was titled hello_world.py."],
-            (
-                "The file was titled incorrect.docx. A sentence.",
-                "The file was titled hello_world.py. A sentence.",
-            ),
-        ),
-    }
-
-    for case, (correct_diffs, (old, new)) in diff_maps.items():
-        diffs = list(diff(old, new))
-        assert len(diffs) == len(correct_diffs)
-        for i in range(len(correct_diffs)):
-            assert diffs[i] == correct_diffs[i]
-
-
-def process_one_revision(
-    case: Revision, parents, map_parent_id_to_lost_kids
-) -> Generator[Dict, None, None]:
-    parent_id = int(case.parent) if case.parent else None
-    parent = parents.pop(parent_id, None) if parent_id else None
-    id = int(case.id)
-    text = case.text
-    case_dict = asdict(case)
-    if parent_id is None:
-        yield case_dict
-    elif parent:
-        parents[id] = case
-        for text in diff(parent["text"], text):
-            yield {**case_dict, "text": text}
-    else:
-        map_parent_id_to_lost_kids[parent_id] = case_dict
-
-    kid = map_parent_id_to_lost_kids.pop(id, None)
-    if kid:
-        for text in diff(text, kid["text"]):
-            yield {**case_dict, "text": text}
+class Exhausted:
+    pass
 
 
 T = TypeVar("T")
 
 
 def merge_generators(
-    executor: Executor,
-    generators: Iterable[Generator[T, None, None]],
-    batchsize: int = 1,
+    executor: Executor, generators: Iterable[Generator[T, None, None]]
 ) -> Generator[T, None, None]:
     """
     Combines the output of multiple generators into a single generator. Uses a `concurrent.futures.Executor` to
     concurrently exhaust input generators. Since regular generators cannot be polled concurrently,
     the number of concurrent tasks submitted by this function is at most the number of generators.
     Output order is not guaranteed.
-
-    If the output of this function is not exhausted, each input generators may be polled up to batchsize times
-    without the results being returned.
-
-    Larger batchsize values are especially useful when dealing with generators that return quickly.
-
     The number of input generators is considered finite and reasonably small.
-
     :param executor: executor in which generators are run.
     :param generators: generators to combine results from.
-    :param batchsize: number of batches polled from each generator sequentially. Default is 1.
     :return: a generator over the combined outputs of all input generators.
     """
 
-    if batchsize < 1:
-        raise ValueError("chunksize must be ≥ 1")
+    exhausted = Exhausted()
 
-    def next_chunk(generator):
-        output = []
-        for value in generator:
-            output.append(value)
-            if len(output) == batchsize:
-                return False, output, generator
-        return True, output, None
+    awaiter = Awaiter(
+        executor.submit(
+            lambda generator: (next(generator, exhausted), generator),
+            generator,
+        )
+        for generator in generators
+    )
+    for (value, generator) in awaiter.as_completed():
+        generator_exhausted = False
+        if value is exhausted:
+            generator_exhausted = True
+        else:
+            yield value
 
-    running_generators = [
-        executor.submit(next_chunk, generator) for generator in generators
-    ]
-    while len(running_generators) > 0:
-        incomplete = []
-        for future in as_completed(running_generators):
-            (is_exhausted, values, generator) = future.result()
-            if not is_exhausted:
-                for value in values:
-                    yield value
-                incomplete.append(executor.submit(next_chunk, generator))
-        running_generators = incomplete
+        if not generator_exhausted:
+            awaiter.add(
+                executor.submit(
+                    lambda generator: (next(generator, exhausted), generator),
+                    generator,
+                )
+            )
 
 
 def test_merge_generators():
@@ -575,47 +399,6 @@ def test_merge_generators():
     with ThreadPoolExecutor() as e:
         assert set(merge_generators(e, (gen1(), gen2()))) == set(range(20))
         assert len(list(merge_generators(e, (gen1(), gen2())))) == 20
-
-
-def all_happy_cases(
-    executor: Executor, revisions: Iterable[Revision]
-) -> Generator[Dict, None, None]:
-    """
-    notes: this function consumes its input. Its output is not ordered.
-
-    Finding all valid cases has significant memory and storage requirements, as we must retain the most recent known
-    revision for
-    every known article in memory as we iterate through all revisions. If input is not ordered, we may also be required
-    to retain multiple revisions of articles until the intermediary ones have been found.
-    """
-    print(f"{strtime()} de-chaining revisions... 🔗")
-    chunk_size = int(os.cpu_count() * 1.5)
-
-    with StorageDict() as map_parent_id_to_lost_kids:
-        with StorageDict() as parents:
-            for intermediary_list in chain(
-                lazy_executor_map(
-                    executor,
-                    lambda tup: [v for v in process_one_revision(*tup)],
-                    (
-                        (revision, parents, map_parent_id_to_lost_kids)
-                        for revision in revisions
-                    ),
-                    max_parallel=chunk_size,
-                )
-            ):
-                for case in intermediary_list:
-                    yield case
-
-        if not len(map_parent_id_to_lost_kids) == 0:
-            orphans_out = "orphans_out.csv.bz2"
-            print(
-                f"orphan revisions identified. Saving in a second output file: {orphans_out}"
-            )
-            with bz2.open(orphans_out, "wt", newline="") as output_file:
-                writer = csv.DictWriter(output_file, Revision.fields())
-                for _id, orphan_case in map_parent_id_to_lost_kids:
-                    writer.writerow(orphan_case)
 
 
 class LazyList:
@@ -1067,18 +850,16 @@ def download_and_parse_files(
         yield revision
 
 
-def write_diffs_from_revisions(
-    executor: Executor, revisions: Iterable[Revision]
-):
+def write_diffs_from_revisions(revisions: Iterable[Revision]):
     with bz2.open("revisions.csv.bz2", "wt", newline="") as output_file:
         writer = csv.DictWriter(output_file, Revision.fields())
 
         i = 0
-        for case in all_happy_cases(executor, revisions):
+        for case in revisions:
             writer.writerow(case)
             i += 1
             if i % 1000000 == 0 or i == 1:
-                print(f"{strtime()} writing revision #{i}")
+                print(f"{strtime()} wrote revision #{i}")
 
     print(f"{strtime()} program complete. 💐")
 
@@ -1089,7 +870,7 @@ if __name__ == "__main__":
         while not complete:
             try:
                 revisions = download_and_parse_files(executor)
-                write_diffs_from_revisions(executor, revisions)
+                write_diffs_from_revisions(revisions)
                 complete = True
             except Exception as e:
                 if getattr(e, "errno", None) == errno.ENOSPC:
