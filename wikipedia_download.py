@@ -21,7 +21,7 @@ from typing import (
     List,
     Tuple,
     TypeVar,
-    Any
+    Any,
 )
 import json
 import tempfile
@@ -160,7 +160,10 @@ def parse_downloads(
     filenames, urls = lazy_dezip(download_file_and_url)
     filenames_and_urls = zip(
         lazy_executor_map(
-            executor, partial(check_hash, VerifiedFilesRecord()), filenames, max_parallel=os.cpu_count() * 3
+            executor,
+            partial(check_hash, VerifiedFilesRecord()),
+            filenames,
+            max_parallel=os.cpu_count() * 3,
         ),
         urls,
     )
@@ -177,7 +180,7 @@ def parse_downloads(
                     (
                         extract_one_file(filename)
                         for filename in files_to_process
-                    )
+                    ),
                 ):
                     yield case
                 files_to_process.clear()
@@ -186,8 +189,7 @@ def parse_downloads(
                 url
             )  # if checksum fails, add bad file to retry file
     for case in merge_generators(
-        executor,
-        (extract_one_file(filename) for filename in files_to_process)
+        executor, (extract_one_file(filename) for filename in files_to_process)
     ):
         yield case
 
@@ -257,7 +259,9 @@ def get_hash(filename: str) -> str:
     return hash.hexdigest()
 
 
-def check_hash(verified_files: VerifiedFilesRecord, filename: str) -> Optional[str]:
+def check_hash(
+    verified_files: VerifiedFilesRecord, filename: str
+) -> Optional[str]:
     if filename not in verified_files:
         print(f"{strtime()} checking hash for {filename}... 📋")
         hash = get_hash(filename)
@@ -518,9 +522,9 @@ def process_one_revision(
 
 T = TypeVar("T")
 
+
 def merge_generators(
-    executor: Executor,
-    generators: Iterable[Generator[T, None, None]],
+    executor: Executor, generators: Iterable[Generator[T, None, None]]
 ) -> Generator[T, None, None]:
     """
     Combines the output of multiple generators into a single generator. Uses a `concurrent.futures.Executor` to
@@ -534,10 +538,12 @@ def merge_generators(
     :param generators: generators to combine results from.
     :return: a generator over the combined outputs of all input generators.
     """
+
     class _Waiter:
         """
             based on _Waiter class in concurrent.futures._base
         """
+
         def __init__(self):
             self.event = threading.Event()
             self.finished_futures = []
@@ -604,7 +610,10 @@ def merge_generators(
 
         def done(self) -> bool:
             with self._waiter.lock:
-                return self._waiter.n_pending == 0 and len(self.prior_completed) == 0
+                return (
+                    self._waiter.n_pending == 0
+                    and len(self.prior_completed) == 0
+                )
 
     class Exhausted:
         pass
@@ -614,7 +623,7 @@ def merge_generators(
     awaiter = Awaiter(
         executor.submit(
             lambda generator: (next(generator, exhausted), generator),
-            generator
+            generator,
         )
         for generator in generators
     )
@@ -629,7 +638,7 @@ def merge_generators(
             awaiter.add(
                 executor.submit(
                     lambda generator: (next(generator, exhausted), generator),
-                    generator
+                    generator,
                 )
             )
 
@@ -670,15 +679,18 @@ class RescanManager:
         )
         complete_cases = [
             case
-            for il in map(
-                lambda tup: process_one_revision(*tup), orphan_tups
-            )
+            for il in map(lambda tup: process_one_revision(*tup), orphan_tups)
             for case in il
         ]
-        print(f"{strtime()} rescan found: {len(complete_cases)} n cases: {len(orphan_cases)} 📡")
+        print(
+            f"{strtime()} rescan found: {len(complete_cases)} n cases: {len(orphan_cases)} 📡"
+        )
         return complete_cases
 
-def revision_processor(executor, chunk_size, parents, map_parent_id_to_lost_kids, revisions):
+
+def revision_processor(
+    executor, chunk_size, parents, map_parent_id_to_lost_kids, revisions
+):
     for intermediary_list in lazy_executor_map(
         executor,
         lambda tup: process_one_revision(asdict(tup[0]), tup[1], tup[2]),
@@ -690,6 +702,7 @@ def revision_processor(executor, chunk_size, parents, map_parent_id_to_lost_kids
     ):
         for case in intermediary_list:
             yield case
+
 
 def all_happy_cases(
     executor: Executor, revisions: Iterable[Revision]
@@ -713,9 +726,15 @@ def all_happy_cases(
     for case in merge_generators(
         executor,
         (
-            revision_processor(executor, chunk_size, parents, map_parent_id_to_lost_kids, revisions),
-            rescan_manager.rescan_repeat()
-        )
+            revision_processor(
+                executor,
+                chunk_size,
+                parents,
+                map_parent_id_to_lost_kids,
+                revisions,
+            ),
+            rescan_manager.rescan_repeat(),
+        ),
     ):
         yield case
 
@@ -1125,7 +1144,7 @@ def lazy_executor_map(
                         )
                     except StopIteration as stop:  # no new tasks! clean up old_futures and then re-raise StopIteration.
                         for remaining_i in range(
-                                        future_i + 1, len(old_futures)
+                            future_i + 1, len(old_futures)
                         ):
                             yield old_futures[remaining_i].result()
                         raise stop
