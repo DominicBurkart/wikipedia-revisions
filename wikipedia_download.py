@@ -8,7 +8,6 @@ import time
 import errno
 import traceback
 from concurrent.futures import ThreadPoolExecutor, Executor, Future
-from dataclasses import dataclass, FrozenInstanceError, asdict
 from functools import partial
 from typing import (
     Optional,
@@ -16,7 +15,6 @@ from typing import (
     Dict,
     Generator,
     Iterable,
-    List,
     Tuple,
     TypeVar,
     Any,
@@ -73,39 +71,10 @@ def download_update_file(session: requests.Session, url: str) -> str:
     return filename
 
 
-@dataclass(frozen=True)
-class Revision:
-    timestamp: str  # date string with timezone
-    text: str  # full text in wiki markup
-    parent: Optional[int]  # numerical ID
-    id: int  # numerical ID
-
-    @classmethod
-    def fields(cls) -> List[str]:
-        return list(cls.__annotations__.keys())
-
-
-def test_revision():
-    r = Revision("2002-02-25 15:51:15+00:00", "this is a text", None, "10")
-
-    # test __init__
-    assert r.timestamp == "2002-02-25 15:51:15+00:00"
-    assert r.text == "this is a text"
-    assert r.parent is None
-    assert r.id == 10
-
-    # test frozen
-    try:
-        r.text = "fields should not be reassignable"
-        raise AssertionError("Field reassign permitted.")
-    except FrozenInstanceError:
-        pass
-
-
-def generate_revisions(file) -> Generator[Revision, None, None]:
+def generate_revisions(file) -> Generator[Dict, None, None]:
     for _end, element in ET.iterparse(file):
         if element.tag.endswith("revision"):
-            parent = None
+            parent_id = None
             for revision_element in element.iter():
                 if revision_element.tag.endswith("revision"):
                     continue  # iter() passes the element and its children
@@ -114,20 +83,24 @@ def generate_revisions(file) -> Generator[Revision, None, None]:
                 elif revision_element.tag.endswith("text"):
                     text = revision_element.text
                 elif revision_element.tag.endswith("parentid"):
-                    parent = revision_element.text
+                    parent_id = revision_element.text
                 elif revision_element.tag.endswith("}id"):
-                    id = revision_element.text
+                    revision_id = revision_element.text
 
-            yield Revision(timestamp, text, parent, id)
+            yield {
+                "id": revision_id,
+                "parent": parent_id,
+                "timestamp": timestamp,
+                "text": text,
+            }
             element.clear()
-
 
 
 def extract_one_file(filename: str) -> Generator[Dict, None, None]:
     print(f"{strtime()} extracting revisions from update file {filename}... 🧛")
     with bz2.open(filename, "rt", newline="") as uncompressed:
         for revision in generate_revisions(uncompressed):
-            yield asdict(revision)
+            yield revision
 
     print(f"{strtime()} exhausted file: {filename} 😴")
     if DELETE:
@@ -242,7 +215,9 @@ def get_hash(filename: str) -> str:
     return hash.hexdigest()
 
 
-def check_hash(verified_files: VerifiedFilesRecord, filename: str) -> Optional[Dict]:
+def check_hash(
+    verified_files: VerifiedFilesRecord, filename: str
+) -> Optional[Dict]:
     if filename not in verified_files:
         print(f"{strtime()} checking hash for {filename}... 📋")
         hash = get_hash(filename)
@@ -254,7 +229,6 @@ def check_hash(verified_files: VerifiedFilesRecord, filename: str) -> Optional[D
             verified_files.add(filename)
 
     return filename
-
 
 
 class Exhausted:
@@ -364,15 +338,14 @@ def merge_generators(
         for generator in generators
     )
     for (value, generator) in waiter.as_completed():
-        if value is exhausted:
-            break
-        yield value
-        waiter.add(
-            executor.submit(
-                lambda generator: (next(generator, exhausted), generator),
-                generator,
+        if value is not exhausted:
+            yield value
+            waiter.add(
+                executor.submit(
+                    lambda generator: (next(generator, exhausted), generator),
+                    generator,
+                )
             )
-        )
 
 
 def test_merge_generators():
@@ -636,7 +609,9 @@ if __name__ == "__main__":
                 with bz2.open(
                     "revisions.csv.bz2", "wt", newline=""
                 ) as output_file:
-                    writer = csv.DictWriter(output_file, Revision.fields())
+                    writer = csv.DictWriter(
+                        output_file, ["id", "parent", "timestamp", "text"]
+                    )
 
                     i = 0
                     for case in revisions:
