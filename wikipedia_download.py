@@ -478,12 +478,10 @@ def lazy_executor_map(
 ) -> Generator[FnOutputType, None, None]:
     """
     Works like executor.map, but sacrifices efficient, grouped thread assignment for eagerness.
-    Runs max_parallel jobs or fewer simultaneously. This is ideal when you have few, long-running tasks instead of
-    many short-running tasks. Input order is preserved.
+    Runs max_parallel jobs or fewer simultaneously. Input order is preserved.
 
     :param max_parallel: Number of parallel jobs to run. Should be greater than zero.
-    :return: A generator that eagerly returns input values. If the generator is not
-    run to exhaustion, the function will not be run for all inputs.
+    :return: A generator of the ordered results of the mapping.
     """
     if max_parallel < 1:
         raise ValueError(
