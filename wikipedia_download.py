@@ -520,6 +520,87 @@ def process_one_revision(
     return []
 
 
+class _Waiter:
+    """
+        based on _Waiter class in concurrent.futures._base
+    """
+
+    def __init__(self):
+        self.event = threading.Event()
+        self.finished_futures = []
+        self.lock = threading.Lock()
+        self.n_pending: int = 0
+
+    def add_result(self, future):
+        with self.lock:
+            self.finished_futures.append(future)
+            self.n_pending -= 1
+        self.event.set()
+
+    def add_exception(self, future):
+        with self.lock:
+            self.finished_futures.append(future)
+            self.n_pending -= 1
+        self.event.set()
+
+    def add_cancelled(self, future):
+        with self.lock:
+            self.finished_futures.append(future)
+            self.n_pending -= 1
+        self.event.set()
+
+
+class Awaiter:
+    """
+        works like concurrent.futures.as_completed, but accepts additional futures during iteration.
+        output ordering is arbitrary.
+    """
+
+    def __init__(self, iterable: Iterable[Future]):
+        self._waiter = _Waiter()
+        self.prior_completed = set()
+        for future in iterable:
+            self.add(future)
+
+    def add(self, future: Future):
+        with future._condition:
+            if future.done():
+                self.prior_completed.add(future)
+            else:
+                future._waiters.append(self._waiter)
+                with self._waiter.lock:
+                    self._waiter.n_pending += 1
+
+    def as_completed(self) -> Generator[Any, None, None]:
+        while not self.done():
+            while len(self.prior_completed) > 0:
+                yield self.prior_completed.pop().result()
+            self._waiter.event.wait()
+            with self._waiter.lock:
+                finished = self._waiter.finished_futures
+                self._waiter.finished_futures = []
+                self._waiter.event.clear()
+            while len(finished) > 0:
+                # assigning the future to a variable will
+                # break the generator. See
+                # concurrent.futures._base._yield_finished_futures
+                with finished[-1]._condition:
+                    finished[-1]._waiters.remove(self._waiter)
+                    result = finished[-1].result()
+                del finished[-1]
+                yield result
+
+    def done(self) -> bool:
+        with self._waiter.lock:
+            return (
+                self._waiter.n_pending == 0 and len(self.prior_completed) == 0
+            )
+
+
+class Exhausted:
+    pass
+
+
 T = TypeVar("T")
 
 
@@ -538,85 +619,6 @@ def merge_generators(
     :param generators: generators to combine results from.
     :return: a generator over the combined outputs of all input generators.
     """
-
-    class _Waiter:
-        """
-            based on _Waiter class in concurrent.futures._base
-        """
-
-        def __init__(self):
-            self.event = threading.Event()
-            self.finished_futures = []
-            self.lock = threading.Lock()
-            self.n_pending: int = 0
-
-        def add_result(self, future):
-            with self.lock:
-                self.finished_futures.append(future)
-                self.n_pending -= 1
-            self.event.set()
-
-        def add_exception(self, future):
-            with self.lock:
-                self.finished_futures.append(future)
-                self.n_pending -= 1
-            self.event.set()
-
-        def add_cancelled(self, future):
-            with self.lock:
-                self.finished_futures.append(future)
-                self.n_pending -= 1
-            self.event.set()
-
-    class Awaiter:
-        """
-            works like concurrent.futures.as_completed, but accepts additional futures during iteration.
-            output ordering is arbitrary.
-        """
-
-        def __init__(self, iterable: Iterable[Future]):
-            self._waiter = _Waiter()
-            self.prior_completed = set()
-            for future in iterable:
-                self.add(future)
-
-        def add(self, future: Future):
-            with future._condition:
-                if future.done():
-                    self.prior_completed.add(future)
-                else:
-                    future._waiters.append(self._waiter)
-                    with self._waiter.lock:
-                        self._waiter.n_pending += 1
-
-        def as_completed(self) -> Generator[Any, None, None]:
-            while not self.done():
-                while len(self.prior_completed) > 0:
-                    yield self.prior_completed.pop().result()
-                self._waiter.event.wait()
-                with self._waiter.lock:
-                    finished = self._waiter.finished_futures
-                    self._waiter.finished_futures = []
-                    self._waiter.event.clear()
-                while len(finished) > 0:
-                    # assigning the future to a variable will
-                    # break the generator. See
-                    # concurrent.futures._base._yield_finished_futures
-                    with finished[-1]._condition:
-                        finished[-1]._waiters.remove(self._waiter)
-                        result = finished[-1].result()
-                    del finished[-1]
-                    yield result
-
-        def done(self) -> bool:
-            with self._waiter.lock:
-                return (
-                    self._waiter.n_pending == 0
-                    and len(self.prior_completed) == 0
-                )
-
-    class Exhausted:
-        pass
 
     exhausted = Exhausted()
 
