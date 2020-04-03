@@ -19,7 +19,7 @@ from typing import (
     List,
     Tuple,
     TypeVar,
-    Any
+    Any,
 )
 import json
 import tempfile
@@ -33,6 +33,7 @@ DUMP_PAGE_URL = f"https://dumps.wikimedia.org/enwiki/{DUMP_DATE}/"
 MD5_HASHES = f"https://dumps.wikimedia.org/enwiki/{DUMP_DATE}/enwiki-{DUMP_DATE}-md5sums.txt"
 DELETE = False  # if true, deletes intermediary files
 USE_LOCAL = True  # if true, get directory and prefer local files if they exist
+
 
 def strtime() -> str:
     return datetime.datetime.now().isoformat()
@@ -151,7 +152,10 @@ def parse_downloads(
     filenames, urls = lazy_dezip(download_file_and_url)
     filenames_and_urls = zip(
         lazy_executor_map(
-            executor, partial(check_hash, VerifiedFilesRecord()), filenames, max_parallel=os.cpu_count() * 3
+            executor,
+            partial(check_hash, VerifiedFilesRecord()),
+            filenames,
+            max_parallel=os.cpu_count() * 3,
         ),
         urls,
     )
@@ -168,7 +172,7 @@ def parse_downloads(
                     (
                         extract_one_file(filename)
                         for filename in files_to_process
-                    )
+                    ),
                 ):
                     yield case
                 files_to_process.clear()
@@ -177,8 +181,7 @@ def parse_downloads(
                 url
             )  # if checksum fails, add bad file to retry file
     for case in merge_generators(
-        executor,
-        (extract_one_file(filename) for filename in files_to_process)
+        executor, (extract_one_file(filename) for filename in files_to_process)
     ):
         yield case
 
@@ -210,7 +213,12 @@ class VerifiedFilesRecord:
 
         self.record_in_storage = "verified_files_record.txt"
         if os.path.exists(self.record_in_storage):
-            self.files = set(map(lambda s: s.strip(), open(self.record_in_storage).readlines()))
+            self.files = set(
+                map(
+                    lambda s: s.strip(),
+                    open(self.record_in_storage).readlines(),
+                )
+            )
         else:
             open(self.record_in_storage, "a").close()
             self.files = set()
@@ -240,7 +248,9 @@ def get_hash(filename: str) -> str:
     return hash.hexdigest()
 
 
-def check_hash(verified_files: VerifiedFilesRecord, filename: str) -> Optional[Dict]:
+def check_hash(
+    verified_files: VerifiedFilesRecord, filename: str
+) -> Optional[Dict]:
     if filename not in verified_files:
         print(f"{strtime()} checking hash for {filename}... 📋")
         hash = get_hash(filename)
@@ -389,7 +399,6 @@ def test_merge_generators():
     with ThreadPoolExecutor() as e:
         assert set(merge_generators(e, (gen1(), gen2()))) == set(range(20))
         assert len(list(merge_generators(e, (gen1(), gen2())))) == 20
-
 
 
 class LazyList:
@@ -841,9 +850,7 @@ def download_and_parse_files(
         yield revision
 
 
-def write_diffs_from_revisions(
-    revisions: Iterable[Revision]
-):
+def write_diffs_from_revisions(revisions: Iterable[Revision]):
     with bz2.open("revisions.csv.bz2", "wt", newline="") as output_file:
         writer = csv.DictWriter(output_file, Revision.fields())
 
