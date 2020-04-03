@@ -8,9 +8,10 @@ import xml.etree.ElementTree as ET
 import time
 import errno
 import traceback
-from concurrent.futures import ThreadPoolExecutor, Executor, as_completed
+from concurrent.futures import ThreadPoolExecutor, Executor, Future
 from dataclasses import dataclass, FrozenInstanceError, asdict
 from functools import partial
+
 from typing import (
     Optional,
     Callable,
@@ -20,7 +21,7 @@ from typing import (
     List,
     Tuple,
     TypeVar,
-    Any,
+    Any
 )
 import json
 import tempfile
@@ -159,7 +160,7 @@ def parse_downloads(
     filenames, urls = lazy_dezip(download_file_and_url)
     filenames_and_urls = zip(
         lazy_executor_map(
-            executor, check_hash, filenames, max_parallel=os.cpu_count() * 3
+            executor, partial(check_hash, VerifiedFilesRecord()), filenames, max_parallel=os.cpu_count() * 3
         ),
         urls,
     )
@@ -176,8 +177,7 @@ def parse_downloads(
                     (
                         extract_one_file(filename)
                         for filename in files_to_process
-                    ),
-                    10,  # read some revisions sequentially to avoid needle moving cost
+                    )
                 ):
                     yield case
                 files_to_process.clear()
@@ -187,8 +187,7 @@ def parse_downloads(
             )  # if checksum fails, add bad file to retry file
     for case in merge_generators(
         executor,
-        (extract_one_file(filename) for filename in files_to_process),
-        100,
+        (extract_one_file(filename) for filename in files_to_process)
     ):
         yield case
 
@@ -200,6 +199,7 @@ class VerifiedFilesRecord:
     """
 
     def __init__(self):
+        self.lock = threading.Lock()
         self.canonical_record = "canonical_hashes.txt"
         while not os.path.exists(self.canonical_record):
             resp = requests.get(MD5_HASHES)
@@ -231,13 +231,15 @@ class VerifiedFilesRecord:
             self.files = set()
 
     def __contains__(self, filename):
-        return filename in self.files
+        with self.lock:
+            return filename in self.files
 
     def add(self, filename):
-        base = os.path.basename(filename)
-        with open(self.record_in_storage, "a") as store:
-            store.write(base + "\n")
-        self.files.add(base)
+        with self.lock:
+            base = os.path.basename(filename)
+            with open(self.record_in_storage, "a") as store:
+                store.write(base + "\n")
+            self.files.add(base)
 
     def canonical_hash(self, filename) -> str:
         base = os.path.basename(filename)
@@ -255,8 +257,7 @@ def get_hash(filename: str) -> str:
     return hash.hexdigest()
 
 
-def check_hash(filename: str) -> Optional[Dict]:
-    verified_files = VerifiedFilesRecord()
+def check_hash(verified_files: VerifiedFilesRecord, filename: str) -> Optional[str]:
     if filename not in verified_files:
         print(f"{strtime()} checking hash for {filename}... 📋")
         hash = get_hash(filename)
@@ -517,11 +518,9 @@ def process_one_revision(
 
 T = TypeVar("T")
 
-
 def merge_generators(
     executor: Executor,
     generators: Iterable[Generator[T, None, None]],
-    batchsize: int = 1,
 ) -> Generator[T, None, None]:
     """
     Combines the output of multiple generators into a single generator. Uses a `concurrent.futures.Executor` to
@@ -529,76 +528,168 @@ def merge_generators(
     the number of concurrent tasks submitted by this function is at most the number of generators.
     Output order is not guaranteed.
 
-    If the output of this function is not exhausted, each input generators may be polled up to batchsize times
-    without the results being returned.
-
-    Larger batchsize values are especially useful when dealing with generators that return quickly.
-
     The number of input generators is considered finite and reasonably small.
 
     :param executor: executor in which generators are run.
     :param generators: generators to combine results from.
-    :param batchsize: number of batches polled from each generator sequentially. Default is 1.
     :return: a generator over the combined outputs of all input generators.
     """
+    class _Waiter:
+        """
+            based on _Waiter class in concurrent.futures._base
+        """
+        def __init__(self):
+            self.event = threading.Event()
+            self.finished_futures = []
+            self.lock = threading.Lock()
+            self.n_pending: int = 0
 
-    if batchsize < 1:
-        raise ValueError("chunksize must be ≥ 1")
+        def add_result(self, future):
+            with self.lock:
+                self.finished_futures.append(future)
+                self.n_pending -= 1
+            self.event.set()
 
-    def next_chunk(generator):
-        output = []
-        for value in generator:
-            output.append(value)
-            if len(output) == batchsize:
-                return False, output, generator
-        return True, output, None
+        def add_exception(self, future):
+            with self.lock:
+                self.finished_futures.append(future)
+                self.n_pending -= 1
+            self.event.set()
 
-    running_generators = [
-        executor.submit(next_chunk, generator) for generator in generators
-    ]
-    while len(running_generators) > 0:
-        incomplete = []
-        for future in as_completed(running_generators):
-            (is_exhausted, values, generator) = future.result()
-            for value in values:
-                yield value
-            if not is_exhausted:
-                incomplete.append(executor.submit(next_chunk, generator))
-        running_generators = incomplete
+        def add_cancelled(self, future):
+            with self.lock:
+                self.finished_futures.append(future)
+                self.n_pending -= 1
+            self.event.set()
+
+    class Awaiter:
+        """
+            works like concurrent.futures.as_completed, but accepts additional futures during iteration.
+            output ordering is arbitrary.
+        """
+
+        def __init__(self, iterable: Iterable[Future]):
+            self._waiter = _Waiter()
+            self.prior_completed = set()
+            for future in iterable:
+                self.add(future)
+
+        def add(self, future: Future):
+            with future._condition:
+                if future.done():
+                    self.prior_completed.add(future)
+                else:
+                    future._waiters.append(self._waiter)
+                    with self._waiter.lock:
+                        self._waiter.n_pending += 1
+
+        def as_completed(self) -> Generator[Any, None, None]:
+            while not self.done():
+                while len(self.prior_completed) > 0:
+                    yield self.prior_completed.pop().result()
+                self._waiter.event.wait()
+                with self._waiter.lock:
+                    finished = self._waiter.finished_futures
+                    self._waiter.finished_futures = []
+                    self._waiter.event.clear()
+                while len(finished) > 0:
+                    # assigning the future to a variable will
+                    # break the generator. See
+                    # concurrent.futures._base._yield_finished_futures
+                    with finished[-1]._condition:
+                        finished[-1]._waiters.remove(self._waiter)
+                        result = finished[-1].result()
+                    del finished[-1]
+                    yield result
+
+        def done(self) -> bool:
+            with self._waiter.lock:
+                return self._waiter.n_pending == 0 and len(self.prior_completed) == 0
+
+    class Exhausted:
+        pass
+
+    exhausted = Exhausted()
+
+    awaiter = Awaiter(
+        executor.submit(
+            lambda generator: (next(generator, exhausted), generator),
+            generator
+        )
+        for generator in generators
+    )
+    for (value, generator) in awaiter.as_completed():
+        generator_exhausted = False
+        if value is exhausted:
+            generator_exhausted = True
+        else:
+            yield value
+
+        if not generator_exhausted:
+            awaiter.add(
+                executor.submit(
+                    lambda generator: (next(generator, exhausted), generator),
+                    generator
+                )
+            )
 
 
 def test_merge_generators():
     def gen1():
-        for x in range(10):
+        for x in range(5):
             yield x
 
     def gen2():
-        for y in range(10, 20):
+        for y in range(5, 10):
             yield y
 
-    with ThreadPoolExecutor() as e:
-        assert set(merge_generators(e, (gen1(), gen2()))) == set(range(20))
-        assert len(list(merge_generators(e, (gen1(), gen2())))) == 20
+    for max_workers in range(1, 20):
+        with ThreadPoolExecutor(max_workers=max_workers) as e:
+            assert set(merge_generators(e, (gen1(), gen2()))) == set(range(10))
+            assert len(list(merge_generators(e, (gen1(), gen2())))) == 10
 
 
-def rescan(
-    executor, map_parent_id_to_lost_kids, parents
-) -> Generator[Dict, None, None]:
-    orphan_cases = list(map_parent_id_to_lost_kids.values())
-    orphan_tups = (
-        (orphan_case, parents, map_parent_id_to_lost_kids)
-        for orphan_case in orphan_cases
-    )
-    complete_cases = [
-        case
-        for il in executor.map(
-            lambda tup: process_one_revision(*tup), orphan_tups
+class RescanManager:
+    def __init__(self, map_parent_id_to_lost_kids, parents):
+        self.map_parent_id_to_lost_kids = map_parent_id_to_lost_kids
+        self.parents = parents
+        self.current_future = None
+        self.revision_exhausted = False
+
+    def rescan_repeat(self) -> Generator[List[Dict], None, None]:
+        while len(self.map_parent_id_to_lost_kids) > 0:
+            for v in self.rescan():
+                yield v
+
+    def rescan(self):
+        orphan_cases = list(self.map_parent_id_to_lost_kids.values())
+
+        orphan_tups = (
+            (orphan_case, self.parents, self.map_parent_id_to_lost_kids)
+            for orphan_case in orphan_cases
         )
-        for case in il
-    ]
-    print(f"rescan found: {len(complete_cases)} n cases: {len(orphan_cases)}")
-    return complete_cases
+        complete_cases = [
+            case
+            for il in map(
+                lambda tup: process_one_revision(*tup), orphan_tups
+            )
+            for case in il
+        ]
+        print(f"{strtime()} rescan found: {len(complete_cases)} n cases: {len(orphan_cases)} 📡")
+        return complete_cases
 
+def revision_processor(executor, chunk_size, parents, map_parent_id_to_lost_kids, revisions):
+    for intermediary_list in lazy_executor_map(
+        executor,
+        lambda tup: process_one_revision(asdict(tup[0]), tup[1], tup[2]),
+        (
+            (revision, parents, map_parent_id_to_lost_kids)
+            for revision in revisions
+        ),
+        max_parallel=chunk_size,
+    ):
+        for case in intermediary_list:
+            yield case
 
 def all_happy_cases(
     executor: Executor, revisions: Iterable[Revision]
@@ -612,41 +703,24 @@ def all_happy_cases(
     to retain multiple revisions of articles until the intermediary ones have been found.
     """
     print(f"{strtime()} de-chaining revisions... 🔗")
-    chunk_size = (os.cpu_count() or 4) * 20
-    rescan_after = 500
-
-    revisions_handled = 0
-    rescan_futures = []
+    chunk_size = os.cpu_count() or 4
 
     parents = dict()
     map_parent_id_to_lost_kids = dict()
+    rescan_manager = RescanManager(map_parent_id_to_lost_kids, parents)
     # with StorageDict() as map_parent_id_to_lost_kids:
     #     with StorageDict() as parents:
-    for intermediary_list in lazy_executor_map(
+    for case in merge_generators(
         executor,
-        lambda tup: process_one_revision(asdict(tup[0]), tup[1], tup[2]),
         (
-            (revision, parents, map_parent_id_to_lost_kids)
-            for revision in revisions
-        ),
-        max_parallel=chunk_size,
+            revision_processor(executor, chunk_size, parents, map_parent_id_to_lost_kids, revisions),
+            rescan_manager.rescan_repeat()
+        )
     ):
-        for case in intermediary_list:
-            yield case
-        revisions_handled += 1
-        if revisions_handled % rescan_after == 0:
-            if len(rescan_futures) < 3:
-                rescan_futures.append(
-                    executor.submit(
-                        lambda tup: rescan(*tup),
-                        (executor, map_parent_id_to_lost_kids, parents),
-                    )
-                )
-            else:
-                for future in as_completed(rescan_futures):
-                    for case in future.result():
-                        yield case
-                rescan_futures = []
+        yield case
+
+    for case in rescan_manager.rescan():
+        yield case
 
     if not len(map_parent_id_to_lost_kids) == 0:
         orphans_out = "orphans_out.csv.bz2"
@@ -1019,21 +1093,46 @@ def lazy_executor_map(
     :return: A generator that eagerly returns input values. If the generator is not
     run to exhaustion, the function will not be run for all inputs.
     """
+
     if max_parallel < 1:
         raise ValueError(
             f"max_parallel is not greater than or equal to one: {max_parallel}"
         )
 
-    chunk = []
-    for inp in function_inputs:
-        chunk.append(inp)
-        if len(chunk) == max_parallel:
-            for v in executor.map(function, chunk):
-                yield v
-            chunk = []
-    if len(chunk) > 0:
-        for v in executor.map(function, chunk):
-            yield v
+    function_inputs_iter = iter(function_inputs)
+    futures = []
+
+    try:
+        while True:
+            while len(futures) < max_parallel:
+                futures.append(
+                    executor.submit(function, next(function_inputs_iter))
+                )
+            old_futures = futures
+            futures = []
+            for future_i in range(len(old_futures)):
+                yield old_futures[future_i].result()
+                num_current_tasks = (
+                    len(old_futures) - (future_i + 1) + len(futures)
+                )
+                if num_current_tasks < max_parallel:
+                    # start next task immediately, unless we're at max_parallel open jobs.
+                    try:
+                        futures.append(
+                            executor.submit(
+                                function, next(function_inputs_iter)
+                            )
+                        )
+                    except StopIteration as stop:  # no new tasks! clean up old_futures and then re-raise StopIteration.
+                        for remaining_i in range(
+                                        future_i + 1, len(old_futures)
+                        ):
+                            yield old_futures[remaining_i].result()
+                        raise stop
+    except StopIteration:
+        pass
+    for future in futures:
+        yield future.result()
 
 
 def lazy_dezip(it: Iterable[Tuple]) -> Iterable[Iterable]:
@@ -1112,19 +1211,20 @@ def write_diffs_from_revisions(
 ):
     with bz2.open("revisions.csv.bz2", "wt", newline="") as output_file:
         writer = csv.DictWriter(output_file, Revision.fields())
+        writer.writeheader()
 
         i = 0
         for case in all_happy_cases(executor, revisions):
             writer.writerow(case)
             i += 1
-            if i % 1000 == 0 or i == 1:
+            if i % 5 == 0 or i == 1:
                 print(f"{strtime()} writing revision #{i}")
 
     print(f"{strtime()} program complete. 💐")
 
 
 if __name__ == "__main__":
-    with ThreadPoolExecutor(max_workers=os.cpu_count() * 20) as executor:
+    with ThreadPoolExecutor() as executor:
         complete = False
         while not complete:
             try:
