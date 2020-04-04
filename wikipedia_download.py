@@ -21,8 +21,6 @@ from typing import (
     TypeVar,
     Any,
 )
-import json
-import tempfile
 import hashlib
 import threading
 
@@ -33,6 +31,7 @@ DUMP_PAGE_URL = f"https://dumps.wikimedia.org/enwiki/{DUMP_DATE}/"
 MD5_HASHES = f"https://dumps.wikimedia.org/enwiki/{DUMP_DATE}/enwiki-{DUMP_DATE}-md5sums.txt"
 DELETE = False  # if true, deletes intermediary files
 USE_LOCAL = True  # if true, get directory and prefer local files if they exist
+MAX_WORKERS = (os.cpu_count() or 4) * 10  # number of concurrent threads
 
 
 def strtime() -> str:
@@ -74,20 +73,12 @@ def download_update_file(session: requests.Session, url: str) -> str:
     return filename
 
 
-@dataclass(init=False, frozen=True)
+@dataclass(frozen=True)
 class Revision:
-    timestamp: str
-    text: str
-    parent: Optional[str]
-    id: str
-
-    def __init__(
-        self, timestamp: str, text: str, parent: Optional[str], id: str
-    ):
-        object.__setattr__(self, "timestamp", timestamp)
-        object.__setattr__(self, "text", text or "")
-        object.__setattr__(self, "parent", int(parent) if parent else None)
-        object.__setattr__(self, "id", int(id))
+    timestamp: str  # date string with timezone
+    text: str  # full text in wiki markup
+    parent: Optional[int]  # numerical ID
+    id: int  # numerical ID
 
     @classmethod
     def fields(cls) -> List[str]:
@@ -131,7 +122,8 @@ def generate_revisions(file) -> Generator[Revision, None, None]:
             element.clear()
 
 
-def extract_one_file(filename: str) -> Dict:
+
+def extract_one_file(filename: str) -> Generator[Dict, None, None]:
     print(f"{strtime()} extracting revisions from update file {filename}... 🧛")
     with bz2.open(filename, "rt", newline="") as uncompressed:
         for revision in generate_revisions(uncompressed):
@@ -147,7 +139,7 @@ def parse_downloads(
     download_file_and_url: Iterable[Tuple[str, str]],
     append_bad_urls,
     executor: Executor,
-):
+) -> Generator[Dict, None, None]:
     # perform checksum
     filenames, urls = lazy_dezip(download_file_and_url)
     filenames_and_urls = zip(
@@ -155,18 +147,17 @@ def parse_downloads(
             executor,
             partial(check_hash, VerifiedFilesRecord()),
             filenames,
-            max_parallel=os.cpu_count() * 3,
+            max_parallel=MAX_WORKERS,
         ),
         urls,
     )
 
     # yield revisions for valid-checksum files
-    chunk_size = int((os.cpu_count() or 4) * 5)
     files_to_process = []
     for filename, url in filenames_and_urls:
         if filename:
             files_to_process.append(filename)
-            if len(files_to_process) == chunk_size:
+            if len(files_to_process) == MAX_WORKERS:
                 for case in merge_generators(
                     executor,
                     (
@@ -179,7 +170,7 @@ def parse_downloads(
         else:
             append_bad_urls.append(
                 url
-            )  # if checksum fails, add bad file to retry file
+            )  # if checksum fails, add incomplete / misformatted file to the retry pile
     for case in merge_generators(
         executor, (extract_one_file(filename) for filename in files_to_process)
     ):
@@ -194,6 +185,7 @@ class VerifiedFilesRecord:
 
     def __init__(self):
         self.canonical_record = "canonical_hashes.txt"
+        self.lock = threading.Lock()
         while not os.path.exists(self.canonical_record):
             resp = requests.get(MD5_HASHES)
             if resp.status_code != 200:
@@ -224,13 +216,15 @@ class VerifiedFilesRecord:
             self.files = set()
 
     def __contains__(self, filename):
-        return filename in self.files
+        with self.lock:
+            return filename in self.files
 
     def add(self, filename):
-        base = os.path.basename(filename)
-        with open(self.record_in_storage, "a") as store:
-            store.write(base + "\n")
-        self.files.add(base)
+        with self.lock:
+            base = os.path.basename(filename)
+            with open(self.record_in_storage, "a") as store:
+                store.write(base + "\n")
+            self.files.add(base)
 
     def canonical_hash(self, filename) -> str:
         base = os.path.basename(filename)
@@ -248,9 +242,7 @@ def get_hash(filename: str) -> str:
     return hash.hexdigest()
 
 
-def check_hash(
-    verified_files: VerifiedFilesRecord, filename: str
-) -> Optional[Dict]:
+def check_hash(verified_files: VerifiedFilesRecord, filename: str) -> Optional[Dict]:
     if filename not in verified_files:
         print(f"{strtime()} checking hash for {filename}... 📋")
         hash = get_hash(filename)
@@ -262,6 +254,11 @@ def check_hash(
             verified_files.add(filename)
 
     return filename
+
+
+
+class Exhausted:
+    pass
 
 
 class _Waiter:
@@ -293,17 +290,24 @@ class _Waiter:
             self.n_pending -= 1
         self.event.set()
 
+    def collect_finished(self):
+        with self.lock:
+            finished = self.finished_futures
+            self.finished_futures = []
+            self.event.clear()
+        return finished
 
-class Awaiter:
+
+class Waiter:
     """
         works like concurrent.futures.as_completed, but accepts additional futures during iteration.
         output ordering is arbitrary.
     """
 
-    def __init__(self, iterable: Iterable[Future]):
+    def __init__(self, futures: Iterable[Future]):
         self._waiter = _Waiter()
         self.prior_completed = set()
-        for future in iterable:
+        for future in futures:
             self.add(future)
 
     def add(self, future: Future):
@@ -320,18 +324,13 @@ class Awaiter:
             while len(self.prior_completed) > 0:
                 yield self.prior_completed.pop().result()
             self._waiter.event.wait()
-            with self._waiter.lock:
-                finished = self._waiter.finished_futures
-                self._waiter.finished_futures = []
-                self._waiter.event.clear()
+            finished = self._waiter.collect_finished()
             while len(finished) > 0:
-                # assigning the future to a variable will
-                # break the generator. See
-                # concurrent.futures._base._yield_finished_futures
-                with finished[-1]._condition:
-                    finished[-1]._waiters.remove(self._waiter)
-                    result = finished[-1].result()
-                del finished[-1]
+                future = finished.pop()
+                with future._condition:
+                    future._waiters.remove(self._waiter)
+                    result = future.result()
+                del future
                 yield result
 
     def done(self) -> bool:
@@ -341,10 +340,6 @@ class Awaiter:
             )
 
 
-class Exhausted:
-    pass
-
-
 T = TypeVar("T")
 
 
@@ -352,39 +347,32 @@ def merge_generators(
     executor: Executor, generators: Iterable[Generator[T, None, None]]
 ) -> Generator[T, None, None]:
     """
-    Combines the output of multiple generators into a single generator. Uses a `concurrent.futures.Executor` to
-    concurrently exhaust input generators. Since regular generators cannot be polled concurrently,
-    the number of concurrent tasks submitted by this function is at most the number of generators.
-    Output order is not guaranteed.
-    The number of input generators is considered finite and reasonably small.
-    :param executor: executor in which generators are run.
+    Combines the output of multiple generators into a single generator. Since regular generators cannot
+    be polled concurrently, the number of concurrent tasks submitted by this function is at most the number
+    of generators.
+
+    :param executor: executor used to increment the generators.
     :param generators: generators to combine results from.
     :return: a generator over the combined outputs of all input generators.
     """
-
     exhausted = Exhausted()
-
-    awaiter = Awaiter(
+    waiter = Waiter(
         executor.submit(
             lambda generator: (next(generator, exhausted), generator),
             generator,
         )
         for generator in generators
     )
-    for (value, generator) in awaiter.as_completed():
-        generator_exhausted = False
+    for (value, generator) in waiter.as_completed():
         if value is exhausted:
-            generator_exhausted = True
-        else:
-            yield value
-
-        if not generator_exhausted:
-            awaiter.add(
-                executor.submit(
-                    lambda generator: (next(generator, exhausted), generator),
-                    generator,
-                )
+            break
+        yield value
+        waiter.add(
+            executor.submit(
+                lambda generator: (next(generator, exhausted), generator),
+                generator,
             )
+        )
 
 
 def test_merge_generators():
@@ -505,220 +493,6 @@ def test_lazy_list_slicing():
     assert x[4:6] == [4, 5]
 
 
-class StorageDict:
-    """
-        Dict-like interface where values are stored on disk (one per temporary file).
-        Values must be able to be encoded as JSONs using the python standard json library.
-        Values on disk are bz2-compressed.
-
-        The files are made in a new temporary directory. The parent for this directory can be set using the path
-        argument. If not set, the working directory is used.
-
-        Filenames are the hash of the key. Files are deleted when a key is deleted, close() is called, or __exit__() is
-        called, as when the end of the `with StorageDict() as d:` indented block is
-        reached, or if an exception occurs within the block).
-
-        Unless you have a really strong reason not to do so, using StorageDict with the context api (`with _ as _:`) is
-        usually the best way to avoid accidentally leaving temporary files on your disk in the case of an uncaught
-        error/exception.
-
-        Basic concurrency is supported (added and deleting
-        entries within unique threads). Multiple simultaneous edits on the same key are *not* currently supported–
-        no lock is implemented.
-
-    """
-
-    keys_to_files: Dict
-    directory: tempfile.TemporaryDirectory
-    num_subdirs: int
-
-    def __init__(self, path=".", num_subdirs=1000):
-        self.keys_to_files = dict()
-        self.directory = tempfile.TemporaryDirectory(dir=path)
-        self.num_subdirs = num_subdirs
-        self.key_lock = threading.Lock()
-
-    def _read_path(self, path):
-        with bz2.open(path, "rt") as f:
-            return json.load(f)
-
-    def __getitem__(self, item):
-        with self.key_lock:
-            path = self.keys_to_files[
-                item
-            ]  # throws KeyError if key not found.
-        return self._read_path(path)
-
-    def __setitem__(self, key, value):
-        key_hash = hash(key)
-        subdir = os.path.join(
-            self.directory.name, str(key_hash % self.num_subdirs)
-        )
-        if not os.path.exists(subdir):
-            try:
-                os.mkdir(subdir)
-            except FileExistsError:
-                pass
-        path = os.path.join(subdir, str(key_hash))
-        with bz2.open(path, "wt") as f:
-            json.dump(value, f)
-        with self.key_lock:
-            self.keys_to_files[key] = path
-
-    def __contains__(self, item):
-        with self.key_lock:
-            return item in self.keys_to_files
-
-    def __delitem__(self, key):
-        with self.key_lock:
-            path = self.keys_to_files.pop(key)
-        os.remove(path)
-
-    def __len__(self):
-        with self.key_lock:
-            return len(self.keys_to_files)
-
-    def __repr__(self):
-        with self.key_lock:
-            return f"<StorageDict object at {id(self)} with {len(self.keys_to_files)} entries>"
-
-    def __iter__(self):
-        with self.key_lock:
-            for k in self.keys_to_files:
-                yield k, self[k]
-
-    def pop(self, *args):
-        try:
-            with self.key_lock:
-                path = self.keys_to_files.pop(args[0])
-            return self._read_path(path)
-        except KeyError:
-            if len(args) == 1:
-                raise KeyError
-            elif len(args) == 2:
-                return args[1]
-            else:
-                raise TypeError(
-                    f"pop takes one or two arguments. {len(args)} arguments passed."
-                )
-
-    def close(self):
-        self.directory.cleanup()
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        self.close()
-
-
-def test_storage_dict_context():
-    with StorageDict() as d:
-        d["nice"] = "cool"
-        d["d"] = {"a": "dictionary"}
-        d["n"] = -1
-
-        assert d["nice"] == "cool"
-        assert d["d"] == {"a": "dictionary"}
-        assert d["n"] == -1
-        directory = d.directory.name
-
-    assert not os.path.exists(directory)
-
-
-def test_storage_dict_delete():
-    with StorageDict() as d:
-        d["n"] = -1
-        del d["n"]
-        try:
-            d["n"]
-        except KeyError:
-            pass
-        else:
-            raise RuntimeError
-
-
-def test_storage_dict_pop():
-    with StorageDict() as d:
-        d["n"] = -1
-        assert d.pop("n", 1) == -1
-        assert d.pop("n", 1) == 1
-        d["n"] = -2
-        assert d.pop("n", 2) == -2
-
-
-def test_storage_dict_set_path():  # hack side effects here are not great
-    test_path = ".test_storage_dict_set_path"
-    if os.path.exists(test_path):
-        os.rmdir(test_path)
-    os.mkdir(test_path)
-    with StorageDict(path=test_path) as d:
-        assert os.path.dirname(d.directory.name) == test_path
-    os.rmdir(test_path)
-
-
-def test_multithreading():
-    def add_value(d: StorageDict, i: int) -> None:
-        d[i] = i
-
-    def delete_value(d: StorageDict, i: int) -> None:
-        del d[i]
-
-    for num_workers in range(1, os.cpu_count() * 5):
-        with StorageDict() as d:
-            with ThreadPoolExecutor(max_workers=num_workers) as executor:
-                list(executor.map(lambda i: add_value(d, i), range(10)))
-                print(
-                    f"test add value: num workers: {num_workers} storage dict: {d}"
-                )
-                for i in range(10):
-                    assert d[i] == i
-                list(executor.map(lambda i: delete_value(d, i), range(10)))
-                print(
-                    f"test delete value: num workers: {num_workers} storage dict: {d}"
-                )
-                assert len(d) == 0
-
-
-def test_with_lazy_executor_map():
-    def add_value(d: StorageDict, i: int) -> None:
-        d[i] = i
-
-    def delete_value(d: StorageDict, i: int) -> None:
-        del d[i]
-
-    for num_workers in range(1, os.cpu_count() * 5):
-        with StorageDict() as d:
-            with ThreadPoolExecutor(max_workers=num_workers) as executor:
-                list(
-                    lazy_executor_map(
-                        executor,
-                        lambda i: add_value(d, i),
-                        range(10),
-                        max_parallel=num_workers,
-                    )
-                )
-                print(
-                    f"test add value: num workers: {num_workers} storage dict: {d}"
-                )
-                for i in range(10):
-                    assert d[i] == i
-
-            with ThreadPoolExecutor(max_workers=num_workers) as executor:
-                list(
-                    lazy_executor_map(
-                        executor,
-                        lambda i: delete_value(d, i),
-                        range(10),
-                        max_parallel=num_workers,
-                    )
-                )
-                print(
-                    f"test delete value: num workers: {num_workers} storage dict: {d}"
-                )
-                assert len(d) == 0
-
-
 FnInputType = TypeVar("FnInputType")
 FnOutputType = TypeVar("FnOutputType")
 
@@ -803,7 +577,7 @@ def test_lazy_dezip():
 
 def download_and_parse_files(
     executor: Executor
-) -> Generator[Revision, None, None]:
+) -> Generator[Dict, None, None]:
     # todo automatically find the last completed bz2 history job
     print(f"{strtime()} program started. 👋")
     print(f"{strtime()} requesting dump directory... 📚")
@@ -850,27 +624,28 @@ def download_and_parse_files(
         yield revision
 
 
-def write_diffs_from_revisions(revisions: Iterable[Revision]):
-    with bz2.open("revisions.csv.bz2", "wt", newline="") as output_file:
-        writer = csv.DictWriter(output_file, Revision.fields())
-
-        i = 0
-        for case in revisions:
-            writer.writerow(case)
-            i += 1
-            if i % 1000000 == 0 or i == 1:
-                print(f"{strtime()} wrote revision #{i}")
-
-    print(f"{strtime()} program complete. 💐")
-
-
 if __name__ == "__main__":
-    with ThreadPoolExecutor() as executor:
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         complete = False
         while not complete:
             try:
+                # download XML files from wikipedia and collect revisions
                 revisions = download_and_parse_files(executor)
-                write_diffs_from_revisions(revisions)
+
+                # write collected revisions to output csv.
+                with bz2.open(
+                    "revisions.csv.bz2", "wt", newline=""
+                ) as output_file:
+                    writer = csv.DictWriter(output_file, Revision.fields())
+
+                    i = 0
+                    for case in revisions:
+                        writer.writerow(case)
+                        i += 1
+                        if i % 1000000 == 0 or i == 1:
+                            print(f"{strtime()} wrote revision #{i}")
+
+                print(f"{strtime()} program complete. 💐")
                 complete = True
             except Exception as e:
                 if getattr(e, "errno", None) == errno.ENOSPC:
