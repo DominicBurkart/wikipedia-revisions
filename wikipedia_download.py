@@ -28,6 +28,7 @@ import click
 
 config = dict()
 
+
 def strtime() -> str:
     return datetime.datetime.now().isoformat()
 
@@ -54,7 +55,7 @@ def download_update_file(session: requests.Session, url: str) -> str:
     retries = 0
     while True:
         try:
-            if  os.path.exists(filename):
+            if os.path.exists(filename):
                 print(f"{strtime()} using local file {filename} 👩‍🌾")
                 break
             _download()
@@ -601,13 +602,32 @@ def download_and_parse_files(
 
 
 @click.command()
-@click.option('--date', default="latest", help='Wikipedia dump page in YYYYMMDD format (like 20200101). Find valid dates by checking which entries on https://dumps.wikimedia.org/enwiki/ have .bz2 files that contain the include "pages-meta-history" in the name and have been successfully written.')
-@click.option('--delete', default=False, help='Delete intermediary files as they are exhausted to save space. False by default to avoid having to re-downloading the same files if the program is interrupted.')
+@click.option(
+    "--date",
+    default="latest",
+    help="Wikipedia dump page in YYYYMMDD format (like 20200101). "
+    "Find valid dates by checking which entries on "
+    "https://dumps.wikimedia.org/enwiki/ have .bz2 files that "
+    'contain the include "pages-meta-history" in the name and '
+    "have been successfully written.",
+)
+@click.option(
+    "--delete",
+    default=False,
+    help="Delete intermediary files as they are exhausted to save "
+    "space. False by default to avoid having to "
+    "re-downloading the same files if the program is "
+    "interrupted.",
+)
 def run(date, delete):
     config["date"] = date
     config["dump_page_url"] = f"https://dumps.wikimedia.org/enwiki/{date}/"
-    config["md5_hashes_url"] = f"https://dumps.wikimedia.org/enwiki/{date}/enwiki-{date}-md5sums.txt"
-    config["max_workers"] = (os.cpu_count() or 4) * 10  # number of concurrent threads
+    config[
+        "md5_hashes_url"
+    ] = f"https://dumps.wikimedia.org/enwiki/{date}/enwiki-{date}-md5sums.txt"
+    config["max_workers"] = (
+        os.cpu_count() or 4
+    ) * 10  # number of concurrent threads
     config["delete"] = delete
 
     with ThreadPoolExecutor(max_workers=config["max_workers"]) as executor:
