@@ -98,7 +98,6 @@ def extract_one_file(filename: str) -> Generator[Dict, None, None]:
     with bz2.open(filename, "rt", newline="") as uncompressed:
         for revision in generate_revisions(uncompressed):
             yield revision
-
     print(f"{strtime()} exhausted file: {filename} 😴")
     if config["delete"]:
         print(f"{strtime()} Deleting {filename}... ✅")
@@ -112,9 +111,8 @@ def make_extractors(
         if filename:
             yield extract_one_file(filename)
         else:
-            append_bad_urls.append(
-                url
-            )  # if checksum fails, add incomplete / misformatted file to the retry pile
+            append_bad_urls.append(url)
+            # ^ if checksum fails, add incomplete / misformatted file to the retry pile
 
 
 def parse_downloads(
@@ -123,20 +121,19 @@ def parse_downloads(
     executor: Executor,
 ) -> Generator[Dict, None, None]:
     # perform checksum
-    filenames, urls = lazy_dezip(download_file_and_url)
-    filenames_and_urls = zip(
-        lazy_executor_map(
-            executor,
-            partial(check_hash, VerifiedFilesRecord()),
-            filenames,
-            max_parallel=config["max_workers"],
-        ),
-        urls,
+    verified_files = VerifiedFilesRecord()
+    filenames_and_urls = lazy_executor_map(
+        executor,
+        lambda tup: (check_hash(verified_files, tup[0]), tup[1]),
+        download_file_and_url,
+        max_parallel=config["max_workers"],
     )
 
-    # yield revisions for valid-checksum files
+    # extract files with valid checksums
     file_extractors = make_extractors(filenames_and_urls, append_bad_urls)
-    for case in merge_generators(executor, file_extractors):
+    for case in merge_generators(
+        executor, file_extractors, chunk_size=config["max_workers"]
+    ):
         yield case
 
 
@@ -210,14 +207,17 @@ def check_hash(
 ) -> Optional[Dict]:
     if filename not in verified_files:
         print(f"{strtime()} checking hash for {filename}... 📋")
-        hash = get_hash(filename)
-        if hash != verified_files.canonical_hash(filename):
-            print(f"{strtime()} Hash mismatch with {filename}. Deleting file.")
+        file_hash = get_hash(filename)
+        if file_hash == verified_files.canonical_hash(filename):
+            verified_files.add(filename)
+        else:
+            print(
+                f"{strtime()} hash mismatch with {filename}. Deleting file.🗑️ "
+            )
             os.remove(filename)
             return None
-        elif not config["delete"]:
-            verified_files.add(filename)
 
+    print(f"{strtime()} {filename} hash verified 💁")
     return filename
 
 
@@ -286,18 +286,22 @@ class Waiter:
                     self._waiter.n_pending += 1
 
     def as_completed(self) -> Generator[Any, None, None]:
+        def process_future(future: Future):
+            with future._condition:
+                future._waiters.remove(self._waiter)
+                return future.result()
+
         while not self.done():
             while len(self.prior_completed) > 0:
                 yield self.prior_completed.pop().result()
-            self._waiter.event.wait()
+            self._waiter.event.wait(20 * 60)
             finished = self._waiter.collect_finished()
             while len(finished) > 0:
-                future = finished.pop()
-                with future._condition:
-                    future._waiters.remove(self._waiter)
-                    result = future.result()
-                del future
-                yield result
+                yield process_future(finished.pop())
+
+        stragglers = self._waiter.collect_finished()
+        while len(stragglers) > 0:
+            yield process_future(stragglers.pop())
 
     def done(self) -> bool:
         if self.completion_lock.locked():
@@ -306,6 +310,15 @@ class Waiter:
             return (
                 self._waiter.n_pending == 0 and len(self.prior_completed) == 0
             )
+
+
+def test_waiter():
+    with ThreadPoolExecutor() as e:
+        futures = [e.submit(lambda x: x, range(10))]
+        waiter = Waiter(futures)
+        for x in range(10, 20):
+            waiter.add(e.submit(lambda x: x, x))
+        set(waiter.as_completed()) == set(range(20))
 
 
 T = TypeVar("T")
@@ -353,7 +366,7 @@ def merge_generators(
             if chunk_size != -1 and (
                 chunk_size <= (state["n_generators"] - state["n_exhausted"])
             ):
-                state["exhaustion_event"].wait()
+                state["exhaustion_event"].wait(20 * 60)
                 state["exhaustion_event"].clear()
         acquired_lock.release()
 
@@ -364,7 +377,7 @@ def merge_generators(
     waiter.completion_lock.acquire()
     async_load_future = executor.submit(
         lambda tup: async_load_generators(*tup),
-        (waiter, generators, waiter.completion_lock),
+        (waiter, iter(generators), waiter.completion_lock),
     )
 
     # yield values as they are completed & request next generator value
@@ -373,15 +386,13 @@ def merge_generators(
             yield value
             waiter.add(
                 executor.submit(
-                    lambda generator: (next(generator, exhausted), generator),
-                    generator,
+                    lambda gen: (next(gen, exhausted), gen), generator
                 )
             )
         else:
             state["n_exhausted"] += 1
-            state[
-                "exhaustion_event"
-            ].set()  # tell the loader it can add more generators if any are available.
+            state["exhaustion_event"].set()
+            # ^ tell the loader it can add more generators if any are available.
 
     assert async_load_future.done()
 
@@ -534,7 +545,6 @@ def lazy_executor_map(
         load_complete = False
         while not load_complete:
             while waiter._waiter.n_pending < max_parallel:
-
                 next_input = next(function_inputs, exhausted)
                 if next_input is not exhausted:
                     new_future = executor.submit(function, next_input)
@@ -543,7 +553,7 @@ def lazy_executor_map(
                     load_complete = True
                     break
             if not load_complete:
-                waiter._waiter.event.wait()
+                waiter._waiter.event.wait(20 * 60)
         acquired_lock.release()
 
     if max_parallel < 1:
