@@ -23,13 +23,10 @@ import hashlib
 import threading
 
 import requests
+import click
 
-DUMP_DATE = "20200101"
-DUMP_PAGE_URL = f"https://dumps.wikimedia.org/enwiki/{DUMP_DATE}/"
-MD5_HASHES = f"https://dumps.wikimedia.org/enwiki/{DUMP_DATE}/enwiki-{DUMP_DATE}-md5sums.txt"
-DELETE = False  # if true, deletes intermediary files
-USE_LOCAL = True  # if true, get directory and prefer local files if they exist
-MAX_WORKERS = (os.cpu_count() or 4) * 10  # number of concurrent threads
+
+config = dict()
 
 
 def strtime() -> str:
@@ -58,7 +55,7 @@ def download_update_file(session: requests.Session, url: str) -> str:
     retries = 0
     while True:
         try:
-            if USE_LOCAL and os.path.exists(filename):
+            if os.path.exists(filename):
                 print(f"{strtime()} using local file {filename} 👩‍🌾")
                 break
             _download()
@@ -103,7 +100,7 @@ def extract_one_file(filename: str) -> Generator[Dict, None, None]:
             yield revision
 
     print(f"{strtime()} exhausted file: {filename} 😴")
-    if DELETE:
+    if config["delete"]:
         print(f"{strtime()} Deleting {filename}... ✅")
         os.remove(filename)
 
@@ -120,7 +117,7 @@ def parse_downloads(
             executor,
             partial(check_hash, VerifiedFilesRecord()),
             filenames,
-            max_parallel=MAX_WORKERS,
+            max_parallel=config["max_workers"],
         ),
         urls,
     )
@@ -130,7 +127,7 @@ def parse_downloads(
     for filename, url in filenames_and_urls:
         if filename:
             files_to_process.append(filename)
-            if len(files_to_process) == MAX_WORKERS:
+            if len(files_to_process) == config["max_workers"]:
                 for case in merge_generators(
                     executor,
                     (
@@ -160,7 +157,7 @@ class VerifiedFilesRecord:
         self.canonical_record = "canonical_hashes.txt"
         self.lock = threading.Lock()
         while not os.path.exists(self.canonical_record):
-            resp = requests.get(MD5_HASHES)
+            resp = requests.get(config["md5_hashes_url"])
             if resp.status_code != 200:
                 print(
                     f"{strtime()} unable to get md5 hashes from wikipedia. "
@@ -225,7 +222,7 @@ def check_hash(
             print(f"{strtime()} Hash mismatch with {filename}. Deleting file.")
             os.remove(filename)
             return None
-        elif not DELETE:
+        elif not config["delete"]:
             verified_files.add(filename)
 
     return filename
@@ -546,8 +543,17 @@ def test_lazy_dezip():
     assert "".join(hij) == "hij"
 
 
+def full_dump_url_from_partial(partial: str):
+    if config["date"] != "latest" and partial.startswith("/"):
+        return "https://dumps.wikimedia.org" + partial
+    elif config["date"] == "latest" and not partial.startswith("/"):
+        return "https://dumps.wikimedia.org/enwiki/latest/" + partial
+    else:
+        raise ValueError("dump page format has been updated.")
+
+
 def download_and_parse_files(
-    executor: Executor
+    executor: Executor,
 ) -> Generator[Dict, None, None]:
     # todo automatically find the last completed bz2 history job
     print(f"{strtime()} program started. 👋")
@@ -561,7 +567,7 @@ def download_and_parse_files(
             "image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.9",
         }
     )
-    dump_page = session.get(DUMP_PAGE_URL)
+    dump_page = session.get(config["dump_page_url"])
 
     assert dump_page.status_code == 200
     print(f"{strtime()} parsing dump directory...  🗺️🗺️")
@@ -569,7 +575,7 @@ def download_and_parse_files(
     # read history file links in dump summary
     updates_urls = LazyList(
         map(
-            lambda partial_url: "https://dumps.wikimedia.org" + partial_url,
+            full_dump_url_from_partial,
             filter(
                 lambda url: "pages-meta-history" in url
                 and url.endswith(".bz2"),
@@ -595,8 +601,36 @@ def download_and_parse_files(
         yield revision
 
 
-if __name__ == "__main__":
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+@click.command()
+@click.option(
+    "--date",
+    default="latest",
+    help="Wikipedia dump page in YYYYMMDD format (like 20200101). "
+    "Find valid dates by checking which entries on "
+    "https://dumps.wikimedia.org/enwiki/ have .bz2 files that "
+    'contain the include "pages-meta-history" in the name and '
+    "have been successfully written.",
+)
+@click.option(
+    "--delete",
+    default=False,
+    help="Delete intermediary files as they are exhausted to save "
+    "space. False by default to avoid having to "
+    "re-downloading the same files if the program is "
+    "interrupted.",
+)
+def run(date, delete):
+    config["date"] = date
+    config["dump_page_url"] = f"https://dumps.wikimedia.org/enwiki/{date}/"
+    config[
+        "md5_hashes_url"
+    ] = f"https://dumps.wikimedia.org/enwiki/{date}/enwiki-{date}-md5sums.txt"
+    config["max_workers"] = (
+        os.cpu_count() or 4
+    ) * 10  # number of concurrent threads
+    config["delete"] = delete
+
+    with ThreadPoolExecutor(max_workers=config["max_workers"]) as executor:
         complete = False
         while not complete:
             try:
@@ -633,3 +667,7 @@ if __name__ == "__main__":
                 )
                 time.sleep(SLEEP_SECONDS)
                 print(f"{strtime()} Restarting...")
+
+
+if __name__ == "__main__":
+    run()
