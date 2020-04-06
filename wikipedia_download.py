@@ -105,6 +105,18 @@ def extract_one_file(filename: str) -> Generator[Dict, None, None]:
         os.remove(filename)
 
 
+def make_extractors(
+    filenames_and_urls, append_bad_urls
+) -> Generator[Generator[Dict, None, None], None, None]:
+    for filename, url in filenames_and_urls:
+        if filename:
+            yield extract_one_file(filename)
+        else:
+            append_bad_urls.append(
+                url
+            )  # if checksum fails, add incomplete / misformatted file to the retry pile
+
+
 def parse_downloads(
     download_file_and_url: Iterable[Tuple[str, str]],
     append_bad_urls,
@@ -123,27 +135,8 @@ def parse_downloads(
     )
 
     # yield revisions for valid-checksum files
-    files_to_process = []
-    for filename, url in filenames_and_urls:
-        if filename:
-            files_to_process.append(filename)
-            if len(files_to_process) == config["max_workers"]:
-                for case in merge_generators(
-                    executor,
-                    (
-                        extract_one_file(filename)
-                        for filename in files_to_process
-                    ),
-                ):
-                    yield case
-                files_to_process.clear()
-        else:
-            append_bad_urls.append(
-                url
-            )  # if checksum fails, add incomplete / misformatted file to the retry pile
-    for case in merge_generators(
-        executor, (extract_one_file(filename) for filename in files_to_process)
-    ):
+    file_extractors = make_extractors(filenames_and_urls, append_bad_urls)
+    for case in merge_generators(executor, file_extractors):
         yield case
 
 
@@ -275,9 +268,11 @@ class Waiter:
         output ordering is arbitrary.
     """
 
-    def __init__(self, futures: Iterable[Future]):
+    def __init__(self, futures: Iterable[Future] = []):
         self._waiter = _Waiter()
         self.prior_completed = set()
+        self.completion_lock = threading.Lock()
+        # ^ when acquired, prevents as_completed from stopping even if there are no running tasks.
         for future in futures:
             self.add(future)
 
@@ -305,6 +300,8 @@ class Waiter:
                 yield result
 
     def done(self) -> bool:
+        if self.completion_lock.locked():
+            return False
         with self._waiter.lock:
             return (
                 self._waiter.n_pending == 0 and len(self.prior_completed) == 0
@@ -315,7 +312,9 @@ T = TypeVar("T")
 
 
 def merge_generators(
-    executor: Executor, generators: Iterable[Generator[T, None, None]]
+    executor: Executor,
+    generators: Iterable[Generator[T, None, None]],
+    chunk_size: int = -1,
 ) -> Generator[T, None, None]:
     """
     Combines the output of multiple generators into a single generator. Since regular generators cannot
@@ -324,16 +323,51 @@ def merge_generators(
 
     :param executor: executor used to increment the generators.
     :param generators: generators to combine results from.
+    :param chunk_size: number of generators to poll from at once. If greater than the number of generators, ignored.
+    if -1, ignored. If zero or a negative number other than -1, raises ValueError.
     :return: a generator over the combined outputs of all input generators.
     """
-    exhausted = Exhausted()
-    waiter = Waiter(
-        executor.submit(
-            lambda generator: (next(generator, exhausted), generator),
-            generator,
+    if chunk_size < 1 and chunk_size != -1:
+        raise ValueError(
+            "chunk_size must be greater than zero or equal to negative 1."
         )
-        for generator in generators
+
+    state = {
+        "n_generators": 0,
+        "n_exhausted": 0,
+        "exhaustion_event": threading.Event(),
+    }
+
+    def async_load_generators(
+        waiter: Waiter,
+        generators: Iterable[Generator[Any, None, None]],
+        acquired_lock: threading.Lock,
+    ) -> None:
+        for generator in generators:
+            future = executor.submit(
+                lambda generator: (next(generator, exhausted), generator),
+                generator,
+            )
+            waiter.add(future)
+            state["n_generators"] += 1
+            if chunk_size != -1 and (
+                chunk_size <= (state["n_generators"] - state["n_exhausted"])
+            ):
+                state["exhaustion_event"].wait()
+                state["exhaustion_event"].clear()
+        acquired_lock.release()
+
+    exhausted = Exhausted()
+    waiter = Waiter()
+
+    # asynchronously load generators
+    waiter.completion_lock.acquire()
+    async_load_future = executor.submit(
+        lambda tup: async_load_generators(*tup),
+        (waiter, generators, waiter.completion_lock),
     )
+
+    # yield values as they are completed & request next generator value
     for (value, generator) in waiter.as_completed():
         if value is not exhausted:
             yield value
@@ -343,6 +377,13 @@ def merge_generators(
                     generator,
                 )
             )
+        else:
+            state["n_exhausted"] += 1
+            state[
+                "exhaustion_event"
+            ].set()  # tell the loader it can add more generators if any are available.
+
+    assert async_load_future.done()
 
 
 def test_merge_generators():
@@ -480,45 +521,56 @@ def lazy_executor_map(
     :param max_parallel: Number of parallel jobs to run. Should be greater than zero.
     :return: A generator of the ordered results of the mapping.
     """
+
+    def async_load(
+        executor: Executor,
+        waiter: Waiter,
+        function: Callable[[FnInputType], FnOutputType],
+        function_inputs: Iterable[FnInputType],
+        max_parallel: int,
+        exhausted: Exhausted,
+        acquired_lock: threading.Lock,
+    ):
+        load_complete = False
+        while not load_complete:
+            while waiter._waiter.n_pending < max_parallel:
+
+                next_input = next(function_inputs, exhausted)
+                if next_input is not exhausted:
+                    new_future = executor.submit(function, next_input)
+                    waiter.add(new_future)
+                else:
+                    load_complete = True
+                    break
+            if not load_complete:
+                waiter._waiter.event.wait()
+        acquired_lock.release()
+
     if max_parallel < 1:
         raise ValueError(
             f"max_parallel is not greater than or equal to one: {max_parallel}"
         )
 
-    function_inputs_iter = iter(function_inputs)
-    futures = []
+    exhausted = Exhausted()
+    waiter = Waiter()
 
-    try:
-        while True:
-            while len(futures) < max_parallel:
-                futures.append(
-                    executor.submit(function, next(function_inputs_iter))
-                )
-            old_futures = futures
-            futures = []
-            for future_i in range(len(old_futures)):
-                yield old_futures[future_i].result()
-                num_current_tasks = (
-                    len(old_futures) - (future_i + 1) + len(futures)
-                )
-                if num_current_tasks < max_parallel:
-                    # start next task immediately, unless we're at max_parallel open jobs.
-                    try:
-                        futures.append(
-                            executor.submit(
-                                function, next(function_inputs_iter)
-                            )
-                        )
-                    except StopIteration as stop:  # no new tasks! clean up old_futures and then re-raise StopIteration.
-                        for remaining_i in range(
-                            future_i + 1, len(old_futures)
-                        ):
-                            yield old_futures[remaining_i].result()
-                        raise stop
-    except StopIteration:
-        pass
-    for future in futures:
-        yield future.result()
+    waiter.completion_lock.acquire()
+    loader = executor.submit(
+        lambda t: async_load(*t),
+        (
+            executor,
+            waiter,
+            function,
+            iter(function_inputs),
+            max_parallel,
+            exhausted,
+            waiter.completion_lock,
+        ),
+    )
+    for result in waiter.as_completed():
+        yield result
+
+    assert loader.done()
 
 
 def lazy_dezip(it: Iterable[Tuple]) -> Iterable[Iterable]:
