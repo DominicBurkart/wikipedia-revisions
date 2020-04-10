@@ -131,10 +131,9 @@ def parse_downloads(
 
     # extract files with valid checksums
     file_extractors = make_extractors(filenames_and_urls, append_bad_urls)
-    for case in merge_generators(
-        executor, file_extractors, chunk_size=config["max_workers"]
-    ):
-        yield case
+    for file_extractor in file_extractors:
+        for case in file_extractor:
+            yield case
 
 
 class VerifiedFilesRecord:
@@ -318,97 +317,7 @@ def test_waiter():
         waiter = Waiter(futures)
         for x in range(10, 20):
             waiter.add(e.submit(lambda x: x, x))
-        set(waiter.as_completed()) == set(range(20))
-
-
-T = TypeVar("T")
-
-
-def merge_generators(
-    executor: Executor,
-    generators: Iterable[Generator[T, None, None]],
-    chunk_size: int = -1,
-) -> Generator[T, None, None]:
-    """
-    Combines the output of multiple generators into a single generator. Since regular generators cannot
-    be polled concurrently, the number of concurrent tasks submitted by this function is at most the number
-    of generators.
-
-    :param executor: executor used to increment the generators.
-    :param generators: generators to combine results from.
-    :param chunk_size: number of generators to poll from at once. If greater than the number of generators, ignored.
-    if -1, ignored. If zero or a negative number other than -1, raises ValueError.
-    :return: a generator over the combined outputs of all input generators.
-    """
-    if chunk_size < 1 and chunk_size != -1:
-        raise ValueError(
-            "chunk_size must be greater than zero or equal to negative 1."
-        )
-
-    state = {
-        "n_generators": 0,
-        "n_exhausted": 0,
-        "exhaustion_event": threading.Event(),
-    }
-
-    def async_load_generators(
-        waiter: Waiter,
-        generators: Iterable[Generator[Any, None, None]],
-        acquired_lock: threading.Lock,
-    ) -> None:
-        for generator in generators:
-            future = executor.submit(
-                lambda generator: (next(generator, exhausted), generator),
-                generator,
-            )
-            waiter.add(future)
-            state["n_generators"] += 1
-            if chunk_size != -1 and (
-                chunk_size <= (state["n_generators"] - state["n_exhausted"])
-            ):
-                state["exhaustion_event"].wait(20 * 60)
-                state["exhaustion_event"].clear()
-        acquired_lock.release()
-
-    exhausted = Exhausted()
-    waiter = Waiter()
-
-    # asynchronously load generators
-    waiter.completion_lock.acquire()
-    async_load_future = executor.submit(
-        lambda tup: async_load_generators(*tup),
-        (waiter, iter(generators), waiter.completion_lock),
-    )
-
-    # yield values as they are completed & request next generator value
-    for (value, generator) in waiter.as_completed():
-        if value is not exhausted:
-            yield value
-            waiter.add(
-                executor.submit(
-                    lambda gen: (next(gen, exhausted), gen), generator
-                )
-            )
-        else:
-            state["n_exhausted"] += 1
-            state["exhaustion_event"].set()
-            # ^ tell the loader it can add more generators if any are available.
-
-    assert async_load_future.done()
-
-
-def test_merge_generators():
-    def gen1():
-        for x in range(10):
-            yield x
-
-    def gen2():
-        for y in range(10, 20):
-            yield y
-
-    with ThreadPoolExecutor() as e:
-        assert set(merge_generators(e, (gen1(), gen2()))) == set(range(20))
-        assert len(list(merge_generators(e, (gen1(), gen2())))) == 20
+        assert set(waiter.as_completed()) == set(range(20))
 
 
 class LazyList:
@@ -681,7 +590,7 @@ def download_and_parse_files(
     "re-downloading the same files if the program is "
     "interrupted.",
 )
-def run(date, delete):
+def run(date, delete, postgres):
     config["date"] = date
     config["dump_page_url"] = f"https://dumps.wikimedia.org/enwiki/{date}/"
     config[
@@ -689,7 +598,7 @@ def run(date, delete):
     ] = f"https://dumps.wikimedia.org/enwiki/{date}/enwiki-{date}-md5sums.txt"
     config["max_workers"] = (
         os.cpu_count() or 4
-    ) * 10  # number of concurrent threads
+    ) * 2  # number of concurrent threads
     config["delete"] = delete
 
     with ThreadPoolExecutor(max_workers=config["max_workers"]) as executor:
