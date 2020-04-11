@@ -313,10 +313,10 @@ class Waiter:
 
 def test_waiter():
     with ThreadPoolExecutor() as e:
-        futures = [e.submit(lambda x: x, range(10))]
+        futures = [e.submit(lambda x: x, i) for i in range(10)]
         waiter = Waiter(futures)
-        for x in range(10, 20):
-            waiter.add(e.submit(lambda x: x, x))
+        for i in range(10, 20):
+            waiter.add(e.submit(lambda x: x, i))
         assert set(waiter.as_completed()) == set(range(20))
 
 
