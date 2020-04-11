@@ -63,7 +63,7 @@ Use a wikipedia dump from a specific date:
 python3 wikipedia_download.py --date 20200101
 ```
 
-Output to postgres server named "wikipedia-revisions" waiting at port 5432:
+Output to postgres server named "wikipedia-revisions" waiting at localhost port 5432:
 ```sh
 python3 wikipedia_download.py --database
 ```
