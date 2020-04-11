@@ -25,7 +25,6 @@ import threading
 import requests
 import click
 
-
 config = dict()
 
 
@@ -69,27 +68,76 @@ def download_update_file(session: requests.Session, url: str) -> str:
 
 
 def generate_revisions(file) -> Generator[Dict, None, None]:
-    for _end, element in ET.iterparse(file):
-        if element.tag.endswith("revision"):
-            parent_id = None
-            for revision_element in element.iter():
-                if revision_element.tag.endswith("revision"):
-                    continue  # iter() passes the element and its children
-                elif revision_element.tag.endswith("timestamp"):
-                    timestamp = revision_element.text
-                elif revision_element.tag.endswith("text"):
-                    text = revision_element.text
-                elif revision_element.tag.endswith("parentid"):
-                    parent_id = revision_element.text
-                elif revision_element.tag.endswith("}id"):
-                    revision_id = revision_element.text
+    def prefixed(s: str) -> str:
+        """element names have the following string prepended to them."""
+        return "{http://www.mediawiki.org/xml/export-0.10/}" + s
 
-            yield {
-                "id": revision_id,
-                "parent": parent_id,
-                "timestamp": timestamp,
-                "text": text,
-            }
+    ID_STR = prefixed("id")
+    NS_STR = prefixed("ns")
+    TITLE_STR = prefixed("title")
+    REVISION_STR = prefixed("revision")
+    PARENT_ID_STR = prefixed("parent_id")
+    TIMESTAMP_STR = prefixed("timestamp")
+    CONTRIBUTOR_STR = prefixed("contributor")
+    IP_STR = prefixed("ip")
+    USERNAME_STR = prefixed("username")
+    COMMENT_STR = prefixed("comment")
+    TEXT_STR = prefixed("text")
+
+    for _end, element in ET.iterparse(file):
+        if element.tag.endswith("page"):
+            page_id = element.find(ID_STR).text
+            page_ns = element.find(NS_STR).text
+            page_title = element.find(TITLE_STR).text
+            for revision_element in element.iterfind(REVISION_STR):
+                revision_id = revision_element.find(ID_STR).text
+                parent_id_element = revision_element.find(PARENT_ID_STR)
+                parent_id = (
+                    parent_id_element.text
+                    if parent_id_element is not None
+                    else None
+                )
+                timestamp = revision_element.find(TIMESTAMP_STR).text
+                contributor_element = revision_element.find(CONTRIBUTOR_STR)
+                ip_element = contributor_element.find(IP_STR)
+                contributor_ip = (
+                    ip_element.text if ip_element is not None else None
+                )
+                contributor_id_element = contributor_element.find(ID_STR)
+                contributor_id = (
+                    contributor_id_element.text
+                    if contributor_id_element is not None
+                    else None
+                )
+                contributor_name_element = contributor_element.find(
+                    USERNAME_STR
+                )
+                contributor_name = (
+                    contributor_name_element.text
+                    if contributor_name_element is not None
+                    else None
+                )
+                comment_element = revision_element.find(COMMENT_STR)
+                comment = (
+                    comment_element.text
+                    if comment_element is not None
+                    else None
+                )
+                text = revision_element.find(TEXT_STR).text
+                yield {
+                    "id": revision_id,
+                    "parent_id": parent_id,
+                    "timestamp": timestamp,
+                    "page_id": page_id,
+                    "page_title": page_title,
+                    "page_ns": page_ns,
+                    "contributor_id": contributor_id,
+                    "contributor_name": contributor_name,
+                    "contributor_ip": contributor_ip,
+                    "comment": comment,
+                    "text": text,
+                }
+                revision_element.clear()
             element.clear()
 
 
@@ -112,7 +160,7 @@ def make_extractors(
             yield extract_one_file(filename)
         else:
             append_bad_urls.append(url)
-            # ^ if checksum fails, add incomplete / misformatted file to the retry pile
+            # ^ if there is no filename, add url to the retry pile
 
 
 def parse_downloads(
@@ -572,9 +620,116 @@ def download_and_parse_files(
         yield revision
 
 
+def write_to_csv(revisions: Iterable[Dict]) -> None:
+    with bz2.open("revisions.csv.bz2", "wt", newline="") as output_file:
+        writer = csv.DictWriter(
+            output_file,
+            [
+                "id",
+                "parent_id",
+                "page_title",
+                "contributor_id",
+                "contributor_name",
+                "contributor_ip",
+                "timestamp",
+                "text",
+                "comment",
+                "page_id",
+                "page_ns",
+            ],
+        )
+        writer.writeheader()
+        i = 0
+        for case in revisions:
+            writer.writerow(case)
+            i += 1
+            if i % 1000000 == 0 or i == 1:
+                print(f"{strtime()} wrote revision #{i}")
+
+
+class DatabaseAlreadyExists(Exception):
+    pass
+
+
+def write_to_database(revisions: Iterable[Dict]) -> None:
+    from dateutil.parser import parse as parse_timestamp
+    from sqlalchemy import create_engine, Column, Integer, Text, DateTime
+    from sqlalchemy.orm import sessionmaker
+    from sqlalchemy_utils import (
+        database_exists,
+        create_database,
+        drop_database,
+    )
+    from sqlalchemy.ext.declarative import declarative_base
+
+    Base = declarative_base()
+
+    class Revision(Base):
+        __tablename__ = "revisions"
+        id = Column(Integer, primary_key=True)
+        parent_id = Column(Integer)
+        timestamp = Column(DateTime, nullable=False)
+        text = Column(Text)
+        comment = Column(Text)
+        page_id = Column(Integer, nullable=False)
+        page_title = Column(Text, nullable=False)
+        page_ns = Column(Integer, nullable=False)
+        contributor_id = Column(Integer)
+        contributor_name = Column(Text)
+        contributor_ip = Column(Text)
+
+    def retype_revision(revision: Dict) -> Dict:
+        parent_id_str = revision["parent_id"]
+        contributor_id_str = revision["contributor_id"]
+        return {
+            **revision,
+            "id": int(revision["id"]),
+            "parent_id": int(parent_id_str)
+            if parent_id_str is not None
+            else None,
+            "timestamp": parse_timestamp(revision["timestamp"]),
+            "contributor_id": int(contributor_id_str)
+            if contributor_id_str
+            else None,
+        }
+
+    print(f"{strtime()} structuring database... 📐")
+    engine = create_engine(config["database_url"])
+    if database_exists(engine.url):
+        raise DatabaseAlreadyExists
+
+    try:
+        create_database(engine.url)
+        assert database_exists(engine.url)
+        Base.metadata.create_all(engine)
+        Session = sessionmaker(bind=engine)
+        session = Session()
+        print(f"{strtime()} adding revisions to session... 📖")
+        i = 0
+        for revision in revisions:
+            session.add(Revision(**retype_revision(revision)))
+            i += 1
+            if i % 100 == 0:
+                session.flush()
+            if i % 1000000 == 0 or i == 1:
+                print(f"{strtime()} wrote revision #{i}")
+        print(f"{strtime()} committing session with {i} revisions... 🤝")
+        session.commit()
+        print(
+            f"{strtime()} revisions written to database at: {config['database_url']} 🌈"
+        )
+    except Exception as e:
+        print(
+            f"{strtime()} exception while writing. deleting partial database & re-raising exception. 🌋"
+        )
+        drop_database(engine.url)
+        raise e
+
+
 @click.command()
 @click.option(
     "--date",
+    "date",
     default="latest",
     help="Wikipedia dump page in YYYYMMDD format (like 20200101). "
     "Find valid dates by checking which entries on "
@@ -584,13 +739,30 @@ def download_and_parse_files(
 )
 @click.option(
     "--delete",
+    "delete",
     default=False,
-    help="Delete intermediary files as they are exhausted to save "
+    help="Delete downloaded xml files as they are exhausted to save "
     "space. False by default to avoid having to "
     "re-downloading the same files if the program is "
     "interrupted.",
 )
-def run(date, delete, postgres):
+@click.option(
+    "--database/--csv",
+    "use_database",
+    default=False,
+    help="Write output into a database instead of a CSV. "
+    "Requires additional installations (run pip install -r "
+    "database_requirements.txt) and for the database URL (see "
+    "--database-url) to be available.",
+)
+@click.option(
+    "--database-url",
+    default="postgres://postgres@localhost:5342/wikipedia-revisions",
+    help="Database URL to use. Defines database dialect used (any "
+    "database dialect supported by SQLAlchemy should work). Default is: "
+    "postgres://postgres@localhost:5342/wikipedia-revisions",
+)
+def run(date, delete, use_database, database_url):
     config["date"] = date
     config["dump_page_url"] = f"https://dumps.wikimedia.org/enwiki/{date}/"
     config[
@@ -600,6 +772,7 @@ def run(date, delete, postgres):
         os.cpu_count() or 4
     ) * 2  # number of concurrent threads
     config["delete"] = delete
+    config["database_url"] = database_url
 
     with ThreadPoolExecutor(max_workers=config["max_workers"]) as executor:
         complete = False
@@ -608,27 +781,22 @@ def run(date, delete, postgres):
                 # download XML files from wikipedia and collect revisions
                 revisions = download_and_parse_files(executor)
 
-                # write collected revisions to output csv.
-                with bz2.open(
-                    "revisions.csv.bz2", "wt", newline=""
-                ) as output_file:
-                    writer = csv.DictWriter(
-                        output_file, ["id", "parent", "timestamp", "text"]
-                    )
-
-                    i = 0
-                    for case in revisions:
-                        writer.writerow(case)
-                        i += 1
-                        if i % 1000000 == 0 or i == 1:
-                            print(f"{strtime()} wrote revision #{i}")
-
+                # write collected revisions to output.
+                if use_database:
+                    write_to_database(revisions)
+                else:
+                    write_to_csv(revisions)
                 print(f"{strtime()} program complete. 💐")
                 complete = True
             except Exception as e:
                 if getattr(e, "errno", None) == errno.ENOSPC:
                     print(
                         f"{strtime()} no space left on device. Ending program. 😲"
+                    )
+                    raise e
+                elif isinstance(e, DatabaseAlreadyExists):
+                    print(
+                        f"{strtime()} there is already a local version of the database. Doing nothing. 🌅"
                     )
                     raise e
                 SLEEP_SECONDS = 5 * 60
