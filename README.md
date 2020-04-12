@@ -30,7 +30,7 @@ I wrote a [blog post](https://dominicburkart.com/blog/2020/big_data_and_small_co
 goals and technical choices. PyPy is supported while outputting to a csv,
 but not while outputting to a database.
 
-## Installation
+## Install
 
 For writing to a bz2-compressed csv file:
 ```sh
