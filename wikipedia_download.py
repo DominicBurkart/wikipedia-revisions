@@ -170,7 +170,7 @@ def parse_downloads(
 ) -> Generator[Dict, None, None]:
     # perform checksum
     verified_files = VerifiedFilesRecord()
-    filenames_and_urls = lazy_executor_map(
+    filenames_and_urls = incremental_executor_map(
         executor,
         lambda tup: (check_hash(verified_files, tup[0]), tup[1]),
         download_file_and_url,
@@ -476,7 +476,7 @@ FnInputType = TypeVar("FnInputType")
 FnOutputType = TypeVar("FnOutputType")
 
 
-def lazy_executor_map(
+def incremental_executor_map(
     executor: Executor,
     function: Callable[[FnInputType], FnOutputType],
     function_inputs: Iterable[FnInputType],
@@ -484,13 +484,13 @@ def lazy_executor_map(
 ) -> Generator[FnOutputType, None, None]:
     """
     Works like executor.map, but sacrifices efficient, grouped thread assignment for eagerness.
-    Runs max_parallel jobs or fewer simultaneously. Input order is preserved.
+    Runs max_parallel jobs or fewer simultaneously. Input order is NOT preserved.
 
     :param max_parallel: Number of parallel jobs to run. Should be greater than zero.
-    :return: A generator of the ordered results of the mapping.
+    :return: A generator of the unordered results of the mapping.
     """
 
-    def async_load(
+    def load(
         executor: Executor,
         waiter: Waiter,
         function: Callable[[FnInputType], FnOutputType],
@@ -523,7 +523,7 @@ def lazy_executor_map(
 
     waiter.completion_lock.acquire()
     loader = executor.submit(
-        lambda t: async_load(*t),
+        lambda t: load(*t),
         (
             executor,
             waiter,
@@ -604,14 +604,15 @@ def download_and_parse_files(
     )
 
     # download & process the history files
-    file_and_url = zip(
-        lazy_executor_map(
-            executor,
-            partial(download_update_file, session),
-            updates_urls,
-            max_parallel=2,
+    download_update_file_using_session = partial(download_update_file, session)
+    file_and_url = incremental_executor_map(
+        executor,
+        lambda update_url: (
+            download_update_file_using_session(update_url),
+            update_url,
         ),
         updates_urls,
+        max_parallel=2,
     )
 
     for revision in parse_downloads(
