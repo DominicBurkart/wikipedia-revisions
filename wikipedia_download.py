@@ -758,10 +758,10 @@ def write_to_database(revisions: Iterable[Dict]) -> None:
 )
 @click.option(
     "--database-url",
-    default="postgres://postgres@localhost:5342/wikipedia-revisions",
+    default="postgres:////wikipedia-revisions",
     help="Database URL to use. Defines database dialect used (any "
     "database dialect supported by SQLAlchemy should work). Default is: "
-    "postgres://postgres@localhost:5342/wikipedia-revisions",
+    "postgres:////wikipedia-revisions",
 )
 def run(date, delete, use_database, database_url):
     config["date"] = date
