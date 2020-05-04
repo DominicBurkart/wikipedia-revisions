@@ -149,6 +149,7 @@ def extract_one_file(filename: str) -> Generator[Dict, None, None]:
     print(f"{strtime()} exhausted file: {filename} 😴")
     if config["delete"]:
         print(f"{strtime()} Deleting {filename}... ✅")
+
         os.remove(filename)
 
 
@@ -708,10 +709,11 @@ def write_to_database(revisions: Iterable[Dict]) -> None:
         session = Session()
         print(f"{strtime()} adding revisions to session... 📖")
         i = 0
+        flush_per_x_iterations = 1 if config["low_memory"] else 100
         for revision in revisions:
             session.add(Revision(**retype_revision(revision)))
             i += 1
-            if i % 100 == 0:
+            if i % flush_per_x_iterations == 0:
                 session.flush()
             if i % 1000000 == 0 or i == 1:
                 print(f"{strtime()} wrote revision #{i}")
@@ -764,7 +766,15 @@ def write_to_database(revisions: Iterable[Dict]) -> None:
     "database dialect supported by SQLAlchemy should work). Default is: "
     "postgres:////wikipedia-revisions",
 )
-def run(date, delete, use_database, database_url):
+@click.option(
+    "--low-memory/--standard-memory",
+    "low_memory",
+    default=False,
+    help="Optimize for low-memory systems. If writing to database, "
+         "flushes every commit to limit memory usage. Currently only "
+         "useful if outputting to database."
+)
+def run(date, delete, use_database, database_url, low_memory):
     config["date"] = date
     config["dump_page_url"] = f"https://dumps.wikimedia.org/enwiki/{date}/"
     config[
@@ -775,6 +785,7 @@ def run(date, delete, use_database, database_url):
     ) * 2  # number of concurrent threads
     config["delete"] = delete
     config["database_url"] = database_url
+    config["low_memory"] = low_memory
 
     with ThreadPoolExecutor(max_workers=config["max_workers"]) as executor:
         complete = False
