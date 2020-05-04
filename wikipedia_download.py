@@ -252,7 +252,8 @@ def get_hash(filename: str) -> str:
 def check_hash(
     verified_files: VerifiedFilesRecord, filename: str
 ) -> Optional[Dict]:
-    if filename not in verified_files:
+    if config["delete"] or filename not in verified_files:
+        # ^ hack don't rely on verified viles when running in delete mode.
         print(f"{strtime()} checking hash for {filename}... 📋")
         file_hash = get_hash(filename)
         if file_hash == verified_files.canonical_hash(filename):
