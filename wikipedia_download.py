@@ -9,16 +9,7 @@ import errno
 import traceback
 from concurrent.futures import ThreadPoolExecutor, Executor, Future
 from functools import partial
-from typing import (
-    Optional,
-    Callable,
-    Dict,
-    Generator,
-    Iterable,
-    Tuple,
-    TypeVar,
-    Any,
-)
+from typing import Optional, Callable, Dict, Generator, Iterable, Tuple, TypeVar, Any
 import hashlib
 import threading
 
@@ -93,36 +84,26 @@ def generate_revisions(file) -> Generator[Dict, None, None]:
                 revision_id = revision_element.find(ID_STR).text
                 parent_id_element = revision_element.find(PARENT_ID_STR)
                 parent_id = (
-                    parent_id_element.text
-                    if parent_id_element is not None
-                    else None
+                    parent_id_element.text if parent_id_element is not None else None
                 )
                 timestamp = revision_element.find(TIMESTAMP_STR).text
                 contributor_element = revision_element.find(CONTRIBUTOR_STR)
                 ip_element = contributor_element.find(IP_STR)
-                contributor_ip = (
-                    ip_element.text if ip_element is not None else None
-                )
+                contributor_ip = ip_element.text if ip_element is not None else None
                 contributor_id_element = contributor_element.find(ID_STR)
                 contributor_id = (
                     contributor_id_element.text
                     if contributor_id_element is not None
                     else None
                 )
-                contributor_name_element = contributor_element.find(
-                    USERNAME_STR
-                )
+                contributor_name_element = contributor_element.find(USERNAME_STR)
                 contributor_name = (
                     contributor_name_element.text
                     if contributor_name_element is not None
                     else None
                 )
                 comment_element = revision_element.find(COMMENT_STR)
-                comment = (
-                    comment_element.text
-                    if comment_element is not None
-                    else None
-                )
+                comment = comment_element.text if comment_element is not None else None
                 text = revision_element.find(TEXT_STR).text
                 yield {
                     "id": revision_id,
@@ -172,15 +153,17 @@ def parse_downloads(
 
     # perform checksum
     if config["low_storage"]:
-        print(f"{strtime()} [low storage mode] "
-              f"deleting all records of previously verified files.")
+        print(
+            f"{strtime()} [low storage mode] "
+            f"deleting all records of previously verified files."
+        )
         verified_files.remove_local_file_verification()
         filenames_and_urls = peek_ahead(
             executor,
             map(
                 lambda tup: (check_hash(verified_files, tup[0]), tup[1]),
                 download_file_and_url,
-            )
+            ),
         )
     else:
         filenames_and_urls = incremental_executor_map(
@@ -226,10 +209,7 @@ class VerifiedFilesRecord:
         self.record_in_storage = "verified_files_record.txt"
         if os.path.exists(self.record_in_storage):
             self.files = set(
-                map(
-                    lambda s: s.strip(),
-                    open(self.record_in_storage).readlines(),
-                )
+                map(lambda s: s.strip(), open(self.record_in_storage).readlines())
             )
         else:
             open(self.record_in_storage, "a").close()
@@ -268,9 +248,7 @@ def get_hash(filename: str) -> str:
     return hash.hexdigest()
 
 
-def check_hash(
-    verified_files: VerifiedFilesRecord, filename: str
-) -> Optional[Dict]:
+def check_hash(verified_files: VerifiedFilesRecord, filename: str) -> Optional[Dict]:
     if filename not in verified_files:
         print(f"{strtime()} checking hash for {filename}... 📋")
         file_hash = get_hash(filename)
@@ -279,9 +257,7 @@ def check_hash(
                 # ^ hack in low_storage mode the files are deleted when exhausted
                 verified_files.add(filename)
         else:
-            print(
-                f"{strtime()} hash mismatch with {filename}. Deleting file.🗑️ "
-            )
+            print(f"{strtime()} hash mismatch with {filename}. Deleting file.🗑️ ")
             os.remove(filename)
             return None
 
@@ -375,9 +351,7 @@ class Waiter:
         if self.completion_lock.locked():
             return False
         with self._waiter.lock:
-            return (
-                self._waiter.n_pending == 0 and len(self.prior_completed) == 0
-            )
+            return self._waiter.n_pending == 0 and len(self.prior_completed) == 0
 
 
 def test_waiter():
@@ -494,6 +468,8 @@ def test_lazy_list_slicing():
 
 
 T = TypeVar("T")
+
+
 def peek_ahead(executor: Executor, iterable: Iterable[T]) -> Iterable[T]:
     """
     asynchronously computes the next value of an iterable
@@ -504,9 +480,7 @@ def peek_ahead(executor: Executor, iterable: Iterable[T]) -> Iterable[T]:
     """
     is_exhausted = False
     exhausted = Exhausted()
-    next_future = executor.submit(
-        partial(next, iterable, exhausted)
-    )
+    next_future = executor.submit(partial(next, iterable, exhausted))
     while not is_exhausted:
         next_value = next_future.result()
         if next_value is exhausted:
@@ -517,9 +491,9 @@ def peek_ahead(executor: Executor, iterable: Iterable[T]) -> Iterable[T]:
     del next_future
 
 
-
 FnInputType = TypeVar("FnInputType")
 FnOutputType = TypeVar("FnOutputType")
+
 
 def incremental_executor_map(
     executor: Executor,
@@ -616,9 +590,7 @@ def full_dump_url_from_partial(partial: str):
         raise ValueError("dump page format has been updated.")
 
 
-def download_and_parse_files(
-    executor: Executor,
-) -> Generator[Dict, None, None]:
+def download_and_parse_files(executor: Executor,) -> Generator[Dict, None, None]:
     # todo automatically find the last completed bz2 history job
     print(f"{strtime()} program started. 👋")
     print(f"{strtime()} requesting dump directory... 📚")
@@ -641,8 +613,7 @@ def download_and_parse_files(
         map(
             full_dump_url_from_partial,
             filter(
-                lambda url: "pages-meta-history" in url
-                and url.endswith(".bz2"),
+                lambda url: "pages-meta-history" in url and url.endswith(".bz2"),
                 re.findall('href="(.+?)"', dump_page.text),
             ),
         )
@@ -657,7 +628,7 @@ def download_and_parse_files(
                 download_update_file_using_session(update_url),
                 update_url,
             ),
-            updates_urls
+            updates_urls,
         )
     else:
         file_and_url = incremental_executor_map(
@@ -711,11 +682,7 @@ def write_to_database(revisions: Iterable[Dict]) -> None:
     from dateutil.parser import parse as parse_timestamp
     from sqlalchemy import create_engine, Column, Integer, Text, DateTime
     from sqlalchemy.orm import sessionmaker
-    from sqlalchemy_utils import (
-        database_exists,
-        create_database,
-        drop_database,
-    )
+    from sqlalchemy_utils import database_exists, create_database, drop_database
     from sqlalchemy.ext.declarative import declarative_base
 
     Base = declarative_base()
@@ -740,13 +707,9 @@ def write_to_database(revisions: Iterable[Dict]) -> None:
         return {
             **revision,
             "id": int(revision["id"]),
-            "parent_id": int(parent_id_str)
-            if parent_id_str is not None
-            else None,
+            "parent_id": int(parent_id_str) if parent_id_str is not None else None,
             "timestamp": parse_timestamp(revision["timestamp"]),
-            "contributor_id": int(contributor_id_str)
-            if contributor_id_str
-            else None,
+            "contributor_id": int(contributor_id_str) if contributor_id_str else None,
         }
 
     print(f"{strtime()} structuring database... 📐")
@@ -827,15 +790,15 @@ def write_to_database(revisions: Iterable[Dict]) -> None:
     "low_memory",
     default=False,
     help="Optimize for low-memory systems. If writing to database, "
-         "flushes every commit to limit memory usage. Currently only "
-         "useful if outputting to database."
+    "flushes every commit to limit memory usage. Currently only "
+    "useful if outputting to database.",
 )
 @click.option(
     "--delete-database/--do-not-delete-database",
     "delete_database",
     default=False,
     help="drop everything in the passed database and overwrite it with "
-         "the wikipedia revisions data."
+    "the wikipedia revisions data.",
 )
 def run(date, low_storage, use_database, database_url, low_memory, delete_database):
     config["date"] = date
@@ -843,9 +806,7 @@ def run(date, low_storage, use_database, database_url, low_memory, delete_databa
     config[
         "md5_hashes_url"
     ] = f"https://dumps.wikimedia.org/enwiki/{date}/enwiki-{date}-md5sums.txt"
-    config["max_workers"] = (
-        os.cpu_count() or 4
-    ) * 2  # number of concurrent threads
+    config["max_workers"] = (os.cpu_count() or 4) * 2  # number of concurrent threads
     config["low_storage"] = low_storage
     config["database_url"] = database_url
     config["low_memory"] = low_memory
@@ -867,9 +828,7 @@ def run(date, low_storage, use_database, database_url, low_memory, delete_databa
                 complete = True
             except Exception as e:
                 if getattr(e, "errno", None) == errno.ENOSPC:
-                    print(
-                        f"{strtime()} no space left on device. Ending program. 😲"
-                    )
+                    print(f"{strtime()} no space left on device. Ending program. 😲")
                     raise e
                 elif isinstance(e, DatabaseAlreadyExists):
                     print(
