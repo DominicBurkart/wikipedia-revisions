@@ -147,9 +147,8 @@ def extract_one_file(filename: str) -> Generator[Dict, None, None]:
         for revision in generate_revisions(uncompressed):
             yield revision
     print(f"{strtime()} exhausted file: {filename} 😴")
-    if config["delete"]:
+    if config["low_storage"]:
         print(f"{strtime()} Deleting {filename}... ✅")
-
         os.remove(filename)
 
 
@@ -169,14 +168,27 @@ def parse_downloads(
     append_bad_urls,
     executor: Executor,
 ) -> Generator[Dict, None, None]:
-    # perform checksum
     verified_files = VerifiedFilesRecord()
-    filenames_and_urls = incremental_executor_map(
-        executor,
-        lambda tup: (check_hash(verified_files, tup[0]), tup[1]),
-        download_file_and_url,
-        max_parallel=config["max_workers"],
-    )
+
+    # perform checksum
+    if config["low_storage"]:
+        print(f"{strtime()} [low storage mode] "
+              f"deleting all records of previously verified files.")
+        verified_files.remove_local_file_verification()
+        filenames_and_urls = peek_ahead(
+            executor,
+            map(
+                lambda tup: (check_hash(verified_files, tup[0]), tup[1]),
+                download_file_and_url,
+            )
+        )
+    else:
+        filenames_and_urls = incremental_executor_map(
+            executor,
+            lambda tup: (check_hash(verified_files, tup[0]), tup[1]),
+            download_file_and_url,
+            max_parallel=config["max_workers"],
+        )
 
     # extract files with valid checksums
     file_extractors = make_extractors(filenames_and_urls, append_bad_urls)
@@ -238,6 +250,12 @@ class VerifiedFilesRecord:
         base = os.path.basename(filename)
         return self.canonical_hashes[base]
 
+    def remove_local_file_verification(self):
+        with self.lock:
+            with open(self.record_in_storage, "w") as store:
+                store.write("")
+            self.files.clear()
+
 
 def get_hash(filename: str) -> str:
     hash = hashlib.md5()
@@ -253,12 +271,13 @@ def get_hash(filename: str) -> str:
 def check_hash(
     verified_files: VerifiedFilesRecord, filename: str
 ) -> Optional[Dict]:
-    if config["delete"] or filename not in verified_files:
-        # ^ hack don't rely on verified viles when running in delete mode.
+    if filename not in verified_files:
         print(f"{strtime()} checking hash for {filename}... 📋")
         file_hash = get_hash(filename)
         if file_hash == verified_files.canonical_hash(filename):
-            verified_files.add(filename)
+            if not config["low_storage"]:
+                # ^ hack in low_storage mode the files are deleted when exhausted
+                verified_files.add(filename)
         else:
             print(
                 f"{strtime()} hash mismatch with {filename}. Deleting file.🗑️ "
@@ -474,9 +493,33 @@ def test_lazy_list_slicing():
     assert x[4:6] == [4, 5]
 
 
+T = TypeVar("T")
+def peek_ahead(executor: Executor, iterable: Iterable[T]) -> Iterable[T]:
+    """
+    asynchronously computes the next value of an iterable
+
+    :param executor:
+    :param iterable:
+    :return:
+    """
+    is_exhausted = False
+    exhausted = Exhausted()
+    next_future = executor.submit(
+        partial(next, iterable, exhausted)
+    )
+    while not is_exhausted:
+        next_value = next_future.result()
+        if next_value is exhausted:
+            is_exhausted = True
+        else:
+            next_future = executor.submit(partial(next, iterable, exhausted))
+            yield next_value
+    del next_future
+
+
+
 FnInputType = TypeVar("FnInputType")
 FnOutputType = TypeVar("FnOutputType")
-
 
 def incremental_executor_map(
     executor: Executor,
@@ -607,15 +650,25 @@ def download_and_parse_files(
 
     # download & process the history files
     download_update_file_using_session = partial(download_update_file, session)
-    file_and_url = incremental_executor_map(
-        executor,
-        lambda update_url: (
-            download_update_file_using_session(update_url),
-            update_url,
-        ),
-        updates_urls,
-        max_parallel=2,
-    )
+    if config["low_storage"]:
+        print(f"{strtime()} low storage mode active.")
+        file_and_url = map(
+            lambda update_url: (
+                download_update_file_using_session(update_url),
+                update_url,
+            ),
+            updates_urls
+        )
+    else:
+        file_and_url = incremental_executor_map(
+            executor,
+            lambda update_url: (
+                download_update_file_using_session(update_url),
+                update_url,
+            ),
+            updates_urls,
+            max_parallel=2,
+        )
 
     for revision in parse_downloads(
         file_and_url, append_bad_urls=updates_urls, executor=executor
@@ -742,13 +795,12 @@ def write_to_database(revisions: Iterable[Dict]) -> None:
     "have been successfully written.",
 )
 @click.option(
-    "--delete",
-    "delete",
+    "--low-storage/--standard-storage",
+    "low_storage",
     default=False,
-    help="Delete downloaded xml files as they are exhausted to save "
-    "space. False by default to avoid having to "
-    "re-downloading the same files if the program is "
-    "interrupted.",
+    help="Cut performance to decrease storage requirements. Deletes "
+    "files when they are exhausted and keeps at most two "
+    "xml.bz2 stores on disk at once.",
 )
 @click.option(
     "--database/--csv",
@@ -774,7 +826,7 @@ def write_to_database(revisions: Iterable[Dict]) -> None:
          "flushes every commit to limit memory usage. Currently only "
          "useful if outputting to database."
 )
-def run(date, delete, use_database, database_url, low_memory):
+def run(date, low_storage, use_database, database_url, low_memory):
     config["date"] = date
     config["dump_page_url"] = f"https://dumps.wikimedia.org/enwiki/{date}/"
     config[
@@ -783,7 +835,7 @@ def run(date, delete, use_database, database_url, low_memory):
     config["max_workers"] = (
         os.cpu_count() or 4
     ) * 2  # number of concurrent threads
-    config["delete"] = delete
+    config["low_storage"] = low_storage
     config["database_url"] = database_url
     config["low_memory"] = low_memory
 
