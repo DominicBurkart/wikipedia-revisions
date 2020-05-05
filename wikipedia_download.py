@@ -752,7 +752,10 @@ def write_to_database(revisions: Iterable[Dict]) -> None:
     print(f"{strtime()} structuring database... 📐")
     engine = create_engine(config["database_url"])
     if database_exists(engine.url):
-        raise DatabaseAlreadyExists
+        if config["delete_database"]:
+            drop_database(engine.url)
+        else:
+            raise DatabaseAlreadyExists
 
     try:
         create_database(engine.url)
@@ -815,7 +818,8 @@ def write_to_database(revisions: Iterable[Dict]) -> None:
     "--database-url",
     default="postgres:////wikipedia-revisions",
     help="Database URL to use. Defines database dialect used (any "
-    "database dialect supported by SQLAlchemy should work). Default is: "
+    "database dialect supported by SQLAlchemy should work). Ignored"
+    "if --database is not set. Default is: "
     "postgres:////wikipedia-revisions",
 )
 @click.option(
@@ -826,7 +830,14 @@ def write_to_database(revisions: Iterable[Dict]) -> None:
          "flushes every commit to limit memory usage. Currently only "
          "useful if outputting to database."
 )
-def run(date, low_storage, use_database, database_url, low_memory):
+@click.option(
+    "--delete-database/--do-not-delete-database",
+    "delete_database",
+    default=False,
+    help="drop everything in the passed database and overwrite it with "
+         "the wikipedia revisions data."
+)
+def run(date, low_storage, use_database, database_url, low_memory, delete_database):
     config["date"] = date
     config["dump_page_url"] = f"https://dumps.wikimedia.org/enwiki/{date}/"
     config[
@@ -838,6 +849,7 @@ def run(date, low_storage, use_database, database_url, low_memory):
     config["low_storage"] = low_storage
     config["database_url"] = database_url
     config["low_memory"] = low_memory
+    config["delete_database"] = delete_database
 
     with ThreadPoolExecutor(max_workers=config["max_workers"]) as executor:
         complete = False
