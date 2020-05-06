@@ -761,9 +761,9 @@ def write_to_database(revisions: Iterable[Dict]) -> None:
     "have been successfully written.",
 )
 @click.option(
-    "--low-storage/--standard-storage",
+    "--low-storage/--large-storage",
     "low_storage",
-    default=False,
+    default=True,
     help="Cut performance to decrease storage requirements. Deletes "
     "files when they are exhausted and keeps at most two "
     "xml.bz2 stores on disk at once.",
@@ -786,12 +786,13 @@ def write_to_database(revisions: Iterable[Dict]) -> None:
     "postgres:////wikipedia-revisions",
 )
 @click.option(
-    "--low-memory/--standard-memory",
+    "--low-memory/--large-memory",
     "low_memory",
-    default=False,
+    default=True,
     help="Optimize for low-memory systems. If writing to database, "
     "flushes every commit to limit memory usage. Currently only "
-    "useful if outputting to database.",
+    "useful if outputting to database. Should be run if there is less than"
+    "64 gb of available memory (including swap).",
 )
 @click.option(
     "--delete-database/--do-not-delete-database",
