@@ -833,7 +833,8 @@ def run(date, low_storage, use_database, database_url, low_memory, delete_databa
                     raise e
                 elif isinstance(e, DatabaseAlreadyExists):
                     print(
-                        f"{strtime()} there is already a local version of the database. Doing nothing. 🌅"
+                        f"{strtime()} there is already a local version of the database. Doing nothing. HELP: to "
+                        f"overwrite database, use --delete-database flag. 🌅"
                     )
                     raise e
                 SLEEP_SECONDS = 5 * 60
