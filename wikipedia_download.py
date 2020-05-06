@@ -766,7 +766,8 @@ def write_to_database(revisions: Iterable[Dict]) -> None:
     default=True,
     help="Cut performance to decrease storage requirements. Deletes "
     "files when they are exhausted and keeps at most two "
-    "xml.bz2 stores on disk at once.",
+    "xml.bz2 stores on disk at once. If --large-storage, never deletes"
+    "intermediary xml.bz2 files.",
 )
 @click.option(
     "--database/--csv",
