@@ -2,6 +2,7 @@ import bz2
 import csv
 import datetime
 import os
+import sys
 import re
 import xml.etree.ElementTree as ET
 import time
@@ -728,12 +729,17 @@ def write_to_database(revisions: Iterable[Dict]) -> None:
         session = Session()
         print(f"{strtime()} adding revisions to session... 📖")
         i = 0
-        flush_per_x_iterations = 1 if config["low_memory"] else 100
+        size_since_commit = 0
+        max_size = 1024 * 1024 if config["low_memory"] else 1024 * 1024 * 1024
+        # ^ only counts
         for revision in revisions:
+            size_since_commit += sys.getsizeof(revision["text"]) + sys.getsizeof(revision["comment"]) + 300
+            # ^ 300 is a rough estimate of the remaining field size
             session.add(Revision(**retype_revision(revision)))
             i += 1
-            if i % flush_per_x_iterations == 0:
+            if size_since_commit > max_size:
                 session.commit()
+                size_since_commit = 0
             if i % 1000000 == 0 or i == 1:
                 print(f"{strtime()} wrote revision #{i}")
         print(f"{strtime()} committing session with {i} revisions... 🤝")
