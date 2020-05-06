@@ -845,6 +845,10 @@ def run(date, low_storage, use_database, database_url, low_memory, delete_databa
                 )
                 time.sleep(SLEEP_SECONDS)
                 print(f"{strtime()} Restarting...")
+            finally:
+                for fname in ["verified_files.txt", "canonical_hashes.txt"]:
+                    if os.path.exists(fname):
+                        os.remove(fname)
 
 
 if __name__ == "__main__":
