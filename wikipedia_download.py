@@ -733,7 +733,7 @@ def write_to_database(revisions: Iterable[Dict]) -> None:
             session.add(Revision(**retype_revision(revision)))
             i += 1
             if i % flush_per_x_iterations == 0:
-                session.flush()
+                session.commit()
             if i % 1000000 == 0 or i == 1:
                 print(f"{strtime()} wrote revision #{i}")
         print(f"{strtime()} committing session with {i} revisions... 🤝")
