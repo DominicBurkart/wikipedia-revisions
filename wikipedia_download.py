@@ -793,7 +793,7 @@ def write_to_database(revisions: Iterable[Dict]) -> None:
     help="Optimize for low-memory systems. If writing to database, "
     "flushes every commit to limit memory usage. Currently only "
     "useful if outputting to database. Should be run if there is less than"
-    "50 gb of available memory (including swap) NOTE: this upper limit will "
+    "50 gb of available memory (including swap). NOTE: this upper limit will "
     "increase over time as wikpedia pages get longer.",
 )
 @click.option(
