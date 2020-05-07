@@ -176,7 +176,7 @@ def parse_downloads(
 
     # extract files with valid checksums
     file_extractors = make_extractors(filenames_and_urls, append_bad_urls)
-    for file_extractor in file_extractors:
+    for file_extractor in merge_generators(executor, file_extractors, chunk_size=config["max_workers"]/4):
         for case in file_extractor:
             yield case
 
@@ -363,6 +363,94 @@ def test_waiter():
             waiter.add(e.submit(lambda x: x, i))
         assert set(waiter.as_completed()) == set(range(20))
 
+
+T = TypeVar("T")
+
+
+def merge_generators(
+    executor: Executor,
+    generators: Iterable[Generator[T, None, None]],
+    chunk_size: int = -1,
+) -> Generator[T, None, None]:
+    """
+    Combines the output of multiple generators into a single generator. Since regular generators cannot
+    be polled concurrently, the number of concurrent tasks submitted by this function is at most the number
+    of generators.
+    :param executor: executor used to increment the generators.
+    :param generators: generators to combine results from.
+    :param chunk_size: number of generators to poll from at once. If greater than the number of generators, ignored.
+    if -1, ignored. If zero or a negative number other than -1, raises ValueError.
+    :return: a generator over the combined outputs of all input generators.
+    """
+    if chunk_size < 1 and chunk_size != -1:
+        raise ValueError(
+            "chunk_size must be greater than zero or equal to negative 1."
+        )
+
+    state = {
+        "n_generators": 0,
+        "n_exhausted": 0,
+        "exhaustion_event": threading.Event(),
+    }
+
+    def async_load_generators(
+        waiter: Waiter,
+        generators: Iterable[Generator[Any, None, None]],
+        acquired_lock: threading.Lock,
+    ) -> None:
+        for generator in generators:
+            future = executor.submit(
+                lambda generator: (next(generator, exhausted), generator),
+                generator,
+            )
+            waiter.add(future)
+            state["n_generators"] += 1
+            if chunk_size != -1 and (
+                chunk_size <= (state["n_generators"] - state["n_exhausted"])
+            ):
+                state["exhaustion_event"].wait(20 * 60)
+                state["exhaustion_event"].clear()
+        acquired_lock.release()
+
+    exhausted = Exhausted()
+    waiter = Waiter()
+
+    # asynchronously load generators
+    waiter.completion_lock.acquire()
+    async_load_future = executor.submit(
+        lambda tup: async_load_generators(*tup),
+        (waiter, iter(generators), waiter.completion_lock),
+    )
+
+    # yield values as they are completed & request next generator value
+    for (value, generator) in waiter.as_completed():
+        if value is not exhausted:
+            yield value
+            waiter.add(
+                executor.submit(
+                    lambda gen: (next(gen, exhausted), gen), generator
+                )
+            )
+        else:
+            state["n_exhausted"] += 1
+            state["exhaustion_event"].set()
+            # ^ tell the loader it can add more generators if any are available.
+
+    assert async_load_future.done()
+
+
+def test_merge_generators():
+    def gen1():
+        for x in range(10):
+            yield x
+
+    def gen2():
+        for y in range(10, 20):
+            yield y
+
+    with ThreadPoolExecutor() as e:
+        assert set(merge_generators(e, (gen1(), gen2()))) == set(range(20))
+        assert len(list(merge_generators(e, (gen1(), gen2())))) == 20
 
 class LazyList:
     """
@@ -679,7 +767,7 @@ class DatabaseAlreadyExists(Exception):
     pass
 
 
-def write_to_database(revisions: Iterable[Dict]) -> None:
+def write_to_database(executor: Executor, revisions: Iterable[Dict]) -> None:
     from dateutil.parser import parse as parse_timestamp
     from sqlalchemy import create_engine, Column, Integer, Text, DateTime
     from sqlalchemy.orm import sessionmaker
@@ -732,17 +820,23 @@ def write_to_database(revisions: Iterable[Dict]) -> None:
         size_since_commit = 0
         max_size = 1024 * 1024 if config["low_memory"] else 1024 * 1024 * 1024
         # ^ only counts
+        last_commit = None
         for revision in revisions:
             size_since_commit += sys.getsizeof(revision["text"]) + sys.getsizeof(revision["comment"]) + 300
             # ^ 300 is a rough estimate of the remaining field size
             session.add(Revision(**retype_revision(revision)))
             i += 1
             if size_since_commit > max_size:
-                session.commit()
+                if last_commit is not None:
+                    last_commit.result()
+                last_commit = executor.submit(session.commit)
+                session = Session()
                 size_since_commit = 0
             if i % 1000000 == 0 or i == 1:
                 print(f"{strtime()} wrote revision #{i}")
         print(f"{strtime()} committing session with {i} revisions... 🤝")
+        if last_commit is not None:
+            last_commit.result()
         session.commit()
         print(
             f"{strtime()} revisions written to database at: {config['database_url']} 🌈"
@@ -830,7 +924,7 @@ def run(date, low_storage, use_database, database_url, low_memory, delete_databa
 
                 # write collected revisions to output.
                 if use_database:
-                    write_to_database(revisions)
+                    write_to_database(executor, revisions)
                 else:
                     write_to_csv(revisions)
                 print(f"{strtime()} program complete. 💐")
