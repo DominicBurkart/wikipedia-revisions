@@ -817,8 +817,7 @@ def write_to_database(executor: Executor, revisions: Iterable[Dict]) -> None:
         print(f"{strtime()} adding revisions to session... 📖")
         i = 0
         size_since_commit = 0
-        max_size = 1024 * 1024 if config["low_memory"] else 1024 * 1024 * 1024
-        # ^ only counts
+        max_size = 500 if config["low_memory"] else 1024 * 1024 * 1024
         last_commit = None
         for revision in revisions:
             size_since_commit += sys.getsizeof(revision["text"]) + sys.getsizeof(revision["comment"]) + 300
