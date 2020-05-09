@@ -176,9 +176,8 @@ def parse_downloads(
 
     # extract files with valid checksums
     file_extractors = make_extractors(filenames_and_urls, append_bad_urls)
-    for file_extractor in merge_generators(executor, file_extractors, chunk_size=config["max_workers"]/4):
-        for case in file_extractor:
-            yield case
+    for case in merge_generators(executor, file_extractors, chunk_size=config["max_workers"]/4):
+        yield case
 
 
 class VerifiedFilesRecord:
@@ -406,9 +405,9 @@ def merge_generators(
             waiter.add(future)
             state["n_generators"] += 1
             if chunk_size != -1 and (
-                chunk_size <= (state["n_generators"] - state["n_exhausted"])
+                chunk_size >= (state["n_generators"] - state["n_exhausted"])
             ):
-                state["exhaustion_event"].wait(20 * 60)
+                state["exhaustion_event"].wait()
                 state["exhaustion_event"].clear()
         acquired_lock.release()
 
