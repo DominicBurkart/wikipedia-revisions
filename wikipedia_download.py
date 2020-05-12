@@ -58,6 +58,9 @@ def download_update_file(session: requests.Session, url: str) -> str:
             )
     return filename
 
+class MalformattedInput(Exception):
+    ...
+
 
 def generate_revisions(file) -> Generator[Dict, None, None]:
     def prefixed(s: str) -> str:
@@ -67,6 +70,7 @@ def generate_revisions(file) -> Generator[Dict, None, None]:
     ID_STR = prefixed("id")
     NS_STR = prefixed("ns")
     TITLE_STR = prefixed("title")
+    PAGE_STR = prefixed("page")
     REVISION_STR = prefixed("revision")
     PARENT_ID_STR = prefixed("parent_id")
     TIMESTAMP_STR = prefixed("timestamp")
@@ -76,19 +80,32 @@ def generate_revisions(file) -> Generator[Dict, None, None]:
     COMMENT_STR = prefixed("comment")
     TEXT_STR = prefixed("text")
 
-    for _end, element in ET.iterparse(file):
-        if element.tag.endswith("page"):
-            page_id = element.find(ID_STR).text
-            page_ns = element.find(NS_STR).text
-            page_title = element.find(TITLE_STR).text
-            for revision_element in element.iterfind(REVISION_STR):
-                revision_id = revision_element.find(ID_STR).text
-                parent_id_element = revision_element.find(PARENT_ID_STR)
+    page_id = None
+    page_ns = None
+    page_title = None
+    for event, element in ET.iterparse(file, events=["start", "end"]):
+        if event == "end" and element.tag == PAGE_STR:
+            page_id = None
+            page_ns = None
+            page_title = None
+            element.clear()
+        elif event == "end":
+            # hack: assume that the id, ns, and title for a revision all precede the first revision.
+            # if this is not the case, a MalformattedInput exception is thrown.
+            if page_id is None and element.tag == ID_STR:
+                page_id = element.text
+            elif page_ns is None and element.tag == NS_STR:
+                page_ns = element.text
+            elif page_title is None and element.tag == TITLE_STR:
+                page_title = element.text
+            elif element.tag == REVISION_STR:
+                revision_id = element.find(ID_STR).text
+                parent_id_element = element.find(PARENT_ID_STR)
                 parent_id = (
                     parent_id_element.text if parent_id_element is not None else None
                 )
-                timestamp = revision_element.find(TIMESTAMP_STR).text
-                contributor_element = revision_element.find(CONTRIBUTOR_STR)
+                timestamp = element.find(TIMESTAMP_STR).text
+                contributor_element = element.find(CONTRIBUTOR_STR)
                 ip_element = contributor_element.find(IP_STR)
                 contributor_ip = ip_element.text if ip_element is not None else None
                 contributor_id_element = contributor_element.find(ID_STR)
@@ -103,9 +120,11 @@ def generate_revisions(file) -> Generator[Dict, None, None]:
                     if contributor_name_element is not None
                     else None
                 )
-                comment_element = revision_element.find(COMMENT_STR)
+                comment_element = element.find(COMMENT_STR)
                 comment = comment_element.text if comment_element is not None else None
-                text = revision_element.find(TEXT_STR).text
+                text = element.find(TEXT_STR).text
+                if any(v is None for v in (page_id, page_ns, page_title)):
+                    raise MalformattedInput
                 yield {
                     "id": revision_id,
                     "parent_id": parent_id,
@@ -119,8 +138,7 @@ def generate_revisions(file) -> Generator[Dict, None, None]:
                     "comment": comment,
                     "text": text,
                 }
-                revision_element.clear()
-            element.clear()
+                element.clear()
 
 
 def extract_one_file(filename: str) -> Generator[Dict, None, None]:
@@ -176,7 +194,8 @@ def parse_downloads(
 
     # extract files with valid checksums
     file_extractors = make_extractors(filenames_and_urls, append_bad_urls)
-    for case in merge_generators(executor, file_extractors, chunk_size=config["max_workers"]/4):
+    chunk_size = 3 if config["low_memory"] else int(config["max_workers"] / 2)
+    for case in merge_generators(executor, file_extractors, chunk_size=chunk_size):
         yield case
 
 
@@ -405,8 +424,9 @@ def merge_generators(
             waiter.add(future)
             state["n_generators"] += 1
             if chunk_size != -1 and (
-                chunk_size >= (state["n_generators"] - state["n_exhausted"])
+                chunk_size <= (state["n_generators"] - state["n_exhausted"])
             ):
+                print(f"{strtime()} waiting to load additional iterators...")
                 state["exhaustion_event"].wait()
                 state["exhaustion_event"].clear()
         acquired_lock.release()
@@ -817,7 +837,7 @@ def write_to_database(executor: Executor, revisions: Iterable[Dict]) -> None:
         print(f"{strtime()} adding revisions to session... 📖")
         i = 0
         size_since_commit = 0
-        max_size = 500 if config["low_memory"] else 1024 * 1024 * 1024
+        max_size = 1024 * 1024 if config["low_memory"] else 1024 * 1024 * 1024
         last_commit = None
         for revision in revisions:
             size_since_commit += sys.getsizeof(revision["text"]) + sys.getsizeof(revision["comment"]) + 300
@@ -905,7 +925,7 @@ def run(date, low_storage, use_database, database_url, low_memory, delete_databa
     config[
         "md5_hashes_url"
     ] = f"https://dumps.wikimedia.org/enwiki/{date}/enwiki-{date}-md5sums.txt"
-    config["max_workers"] = (os.cpu_count() or 4) * 2  # number of concurrent threads
+    config["max_workers"] = (os.cpu_count() or 4) * 2
     config["low_storage"] = low_storage
     config["database_url"] = database_url
     config["low_memory"] = low_memory
