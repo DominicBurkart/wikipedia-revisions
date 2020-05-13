@@ -522,8 +522,8 @@ def _test_fn_iden(x):
     return x
 
 
-def _test_fn_append(l, v):
-    l.append(v)
+def _test_fn_append(appendable, v):
+    appendable.append(v)
 
 
 def test_lazy_list():
