@@ -58,6 +58,7 @@ def download_update_file(session: requests.Session, url: str) -> str:
             )
     return filename
 
+
 class MalformattedInput(Exception):
     ...
 
@@ -401,15 +402,9 @@ def merge_generators(
     :return: a generator over the combined outputs of all input generators.
     """
     if chunk_size < 1 and chunk_size != -1:
-        raise ValueError(
-            "chunk_size must be greater than zero or equal to negative 1."
-        )
+        raise ValueError("chunk_size must be greater than zero or equal to negative 1.")
 
-    state = {
-        "n_generators": 0,
-        "n_exhausted": 0,
-        "exhaustion_event": threading.Event(),
-    }
+    state = {"n_generators": 0, "n_exhausted": 0, "exhaustion_event": threading.Event()}
 
     def async_load_generators(
         waiter: Waiter,
@@ -418,8 +413,7 @@ def merge_generators(
     ) -> None:
         for generator in generators:
             future = executor.submit(
-                lambda generator: (next(generator, exhausted), generator),
-                generator,
+                lambda generator: (next(generator, exhausted), generator), generator
             )
             waiter.add(future)
             state["n_generators"] += 1
@@ -446,9 +440,7 @@ def merge_generators(
         if value is not exhausted:
             yield value
             waiter.add(
-                executor.submit(
-                    lambda gen: (next(gen, exhausted), gen), generator
-                )
+                executor.submit(lambda gen: (next(gen, exhausted), gen), generator)
             )
         else:
             state["n_exhausted"] += 1
@@ -470,6 +462,7 @@ def test_merge_generators():
     with ThreadPoolExecutor() as e:
         assert set(merge_generators(e, (gen1(), gen2()))) == set(range(20))
         assert len(list(merge_generators(e, (gen1(), gen2())))) == 20
+
 
 class LazyList:
     """
@@ -840,7 +833,11 @@ def write_to_database(executor: Executor, revisions: Iterable[Dict]) -> None:
         max_size = 1024 * 1024 if config["low_memory"] else 1024 * 1024 * 1024
         last_commit = None
         for revision in revisions:
-            size_since_commit += sys.getsizeof(revision["text"]) + sys.getsizeof(revision["comment"]) + 300
+            size_since_commit += (
+                sys.getsizeof(revision["text"])
+                + sys.getsizeof(revision["comment"])
+                + 300
+            )
             # ^ 300 is a rough estimate of the remaining field size
             session.add(Revision(**retype_revision(revision)))
             i += 1
