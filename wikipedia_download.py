@@ -880,9 +880,10 @@ def write_to_database(executor: Executor, revisions: Iterable[Dict]) -> None:
     "low_storage",
     default=True,
     help="Cut performance to decrease storage requirements. Deletes "
-    "files when they are exhausted and keeps at most two "
-    "xml.bz2 stores on disk at once. If --large-storage, never deletes"
-    "intermediary xml.bz2 files.",
+    "files when they are exhausted and keeps a limited number of "
+    ".xml.bz2 files on disk at any time. If --large-storage, eagerly "
+    "downloads all xml.bz2 and never deletes intermediary xml.bz2 "
+    "files.",
 )
 @click.option(
     "--database/--csv",
@@ -905,9 +906,11 @@ def write_to_database(executor: Executor, revisions: Iterable[Dict]) -> None:
     "--low-memory/--large-memory",
     "low_memory",
     default=True,
-    help="Optimize for low-memory systems. If writing to database, "
-    "flushes every commit to limit memory usage. Currently only "
-    "useful if outputting to database.",
+    help="Optimize for low-memory systems. Limits the number of "
+    "dump files concurrently processed to 3, instead of "
+    "the number of CPU cores. If writing to a database, "
+    "also commits every megabyte instead of gigabyte to limit "
+    "memory usage.",
 )
 @click.option(
     "--delete-database/--do-not-delete-database",
