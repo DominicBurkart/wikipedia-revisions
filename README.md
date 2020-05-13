@@ -10,7 +10,7 @@ Revisions are output with the following fields:
 - `id`: the revision id, numeric
 - `parent_id`: parent revision id (if it exists), numeric
 - `page_id`: id of page, numeric
-- `page_name`: name of page
+- `page_title`: name of page
 - `page_ns`: page namespace, numeric
 - `timestamp`: timestamp with timezone
 - `contributor_id`: id of contributor, numeric
@@ -19,7 +19,7 @@ Revisions are output with the following fields:
 - `text`: complete article text after the revision is applied, string in wikipedia markdown
 - `comment`: comment
 
-All fields except id and timestamp may be null.
+The id, timestamp, page_id, page_title, and page_ns cannot be null. All other fields may be null.
 
 System requirements:
 - 4gb memory
@@ -72,3 +72,13 @@ To set the database url:
 ```sh
 python3 wikipedia_download.py --database --database-url postgres://postgres@localhost:5432/wikipedia-revisions
 ```
+
+## Configuration Notes
+The above information is sufficient for you to run the program. The information below is useful for optimization.
+
+- if writing to a database stored on an external drive, run the program in a directory on a different drive than the database (and ideally the OS). The wikidump is downloaded into the current directory, so putting them on a different disk than the output database avoids throughput and needle-moving issues. Here is the command that I used to process the revisions into a local postgres database using an raspberry pi 4 with two external hard drives. It uses around half a gigabyte of memory and writes around 430k revisions per hour. The `nohup` command prevents the command from stopping if the terminal process that spawned it is closed, and the output is saved in nohup.out. The tail program outputs the contents of nohup.out to the screen for monitoring. 
+```sh
+cd /path/to/drive/without/db && > nohup.out && nohup time python3 -u  /home/dominic/scripts/wikipedia-revisions-scraper/wikipedia_download.py --database --date 20200401 --low-storage --low-memory --delete-database & tail -f nohup.out 
+```
+- the `--low-memory` option more closely couples file reading and database I/O. It also limits the number of files actively processed to 3, which might be valuable if you are hitting your IO constraints.
+- using an SSD provides substantial benefits for this program, by increasing IO speed and eliminating needle-moving cost. 
