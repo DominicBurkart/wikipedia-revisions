@@ -20,7 +20,7 @@ import click
 config = dict()
 
 
-def strtime() -> str:
+def timestr() -> str:
     return datetime.datetime.now().isoformat()
 
 
@@ -38,12 +38,12 @@ def download_update_file(executor: Executor, session: requests.Session, url: str
             file.write(result)
 
     filename = url.split("/")[-1]
-    print(f"{strtime()} downloading {url}. saving to {filename}. 📁")
+    print(f"{timestr()} downloading {url}. saving to {filename}. 📁")
     retries = 0
     while True:
         try:
             if os.path.exists(filename):
-                print(f"{strtime()} using local file {filename} 👩‍🌾")
+                print(f"{timestr()} using local file {filename} 👩‍🌾")
                 break
             resp = session.get(url, stream=True, timeout=60)
             assert resp.status_code == 200
@@ -56,7 +56,7 @@ def download_update_file(executor: Executor, session: requests.Session, url: str
         except (requests.exceptions.Timeout, TimeoutError):
             retries += 1
             print(
-                f"{strtime()} timeout for {url}: sleeping 60 seconds and restarting download... (retry #{retries}) ↩️"
+                f"{timestr()} timeout for {url}: sleeping 60 seconds and restarting download... (retry #{retries}) ↩️"
             )
             time.sleep(60)
     return filename
@@ -146,13 +146,13 @@ def generate_revisions(file) -> Generator[Dict, None, None]:
 
 
 def extract_one_file(filename: str) -> Generator[Dict, None, None]:
-    print(f"{strtime()} extracting revisions from update file {filename}... 🧛")
+    print(f"{timestr()} extracting revisions from update file {filename}... 🧛")
     with bz2.open(filename, "rt", newline="") as uncompressed:
         for revision in generate_revisions(uncompressed):
             yield revision
-    print(f"{strtime()} exhausted file: {filename} 😴")
+    print(f"{timestr()} exhausted file: {filename} 😴")
     if config["low_storage"]:
-        print(f"{strtime()} Deleting {filename}... ✅")
+        print(f"{timestr()} Deleting {filename}... ✅")
         os.remove(filename)
 
 
@@ -177,7 +177,7 @@ def parse_downloads(
     # perform checksum
     if config["low_storage"]:
         print(
-            f"{strtime()} [low storage mode] "
+            f"{timestr()} [low storage mode] "
             f"deleting all records of previously verified files."
         )
         verified_files.remove_local_file_verification()
@@ -216,7 +216,7 @@ class VerifiedFilesRecord:
             resp = requests.get(config["md5_hashes_url"])
             if resp.status_code != 200:
                 print(
-                    f"{strtime()} unable to get md5 hashes from wikipedia. "
+                    f"{timestr()} unable to get md5 hashes from wikipedia. "
                     "Sleeping for five minutes then retrying..."
                 )
                 time.sleep(5 * 60)
@@ -273,18 +273,18 @@ def get_hash(filename: str) -> str:
 
 def check_hash(verified_files: VerifiedFilesRecord, filename: str) -> Optional[Dict]:
     if filename not in verified_files:
-        print(f"{strtime()} checking hash for {filename}... 📋")
+        print(f"{timestr()} checking hash for {filename}... 📋")
         file_hash = get_hash(filename)
         if file_hash == verified_files.canonical_hash(filename):
             if not config["low_storage"]:
                 # ^ hack in low_storage mode the files are deleted when exhausted
                 verified_files.add(filename)
         else:
-            print(f"{strtime()} hash mismatch with {filename}. Deleting file.🗑️ ")
+            print(f"{timestr()} hash mismatch with {filename}. Deleting file.🗑️ ")
             os.remove(filename)
             return None
 
-    print(f"{strtime()} {filename} hash verified 💁")
+    print(f"{timestr()} {filename} hash verified 💁")
     return filename
 
 
@@ -423,7 +423,7 @@ def merge_generators(
             if chunk_size != -1 and (
                 chunk_size <= (state["n_generators"] - state["n_exhausted"])
             ):
-                print(f"{strtime()} waiting to load additional iterators...")
+                print(f"{timestr()} waiting to load additional iterators...")
                 state["exhaustion_event"].wait()
                 state["exhaustion_event"].clear()
         acquired_lock.release()
@@ -696,8 +696,8 @@ def full_dump_url_from_partial(partial: str):
 
 def download_and_parse_files(executor: Executor,) -> Generator[Dict, None, None]:
     # todo automatically find the last completed bz2 history job
-    print(f"{strtime()} program started. 👋")
-    print(f"{strtime()} requesting dump directory... 📚")
+    print(f"{timestr()} program started. 👋")
+    print(f"{timestr()} requesting dump directory... 📚")
     session = requests.Session()
     session.headers.update(
         {
@@ -710,7 +710,7 @@ def download_and_parse_files(executor: Executor,) -> Generator[Dict, None, None]
     dump_page = session.get(config["dump_page_url"])
 
     assert dump_page.status_code == 200
-    print(f"{strtime()} parsing dump directory...  🗺️🗺️")
+    print(f"{timestr()} parsing dump directory...  🗺️🗺️")
 
     # read history file links in dump summary
     updates_urls = LazyList(
@@ -778,7 +778,7 @@ def write_to_csv(revisions: Iterable[Dict]) -> None:
             writer.writerow(case)
             i += 1
             if i % 1000000 == 0 or i == 1:
-                print(f"{strtime()} wrote revision #{i}")
+                print(f"{timestr()} wrote revision #{i}")
 
 
 class DatabaseAlreadyExists(Exception):
@@ -819,7 +819,7 @@ def write_to_database(executor: Executor, revisions: Iterable[Dict]) -> None:
             "contributor_id": int(contributor_id_str) if contributor_id_str else None,
         }
 
-    print(f"{strtime()} structuring database... 📐")
+    print(f"{timestr()} structuring database... 📐")
     engine = create_engine(config["database_url"])
     if database_exists(engine.url):
         if config["delete_database"]:
@@ -833,7 +833,7 @@ def write_to_database(executor: Executor, revisions: Iterable[Dict]) -> None:
         Base.metadata.create_all(engine)
         Session = sessionmaker(bind=engine)
         session = Session()
-        print(f"{strtime()} adding revisions to session... 📖")
+        print(f"{timestr()} adding revisions to session... 📖")
         i = 0
         size_since_commit = 0
         max_size = 1024 * 1024 if config["low_memory"] else 1024 * 1024 * 1024
@@ -854,17 +854,17 @@ def write_to_database(executor: Executor, revisions: Iterable[Dict]) -> None:
                 session = Session()
                 size_since_commit = 0
             if i % 1000000 == 0 or i == 1:
-                print(f"{strtime()} wrote revision #{i}")
-        print(f"{strtime()} committing session with {i} revisions... 🤝")
+                print(f"{timestr()} wrote revision #{i}")
+        print(f"{timestr()} committing session with {i} revisions... 🤝")
         if last_commit is not None:
             last_commit.result()
         session.commit()
         print(
-            f"{strtime()} revisions written to database at: {config['database_url']} 🌈"
+            f"{timestr()} revisions written to database at: {config['database_url']} 🌈"
         )
     except Exception as e:
         print(
-            f"{strtime()} exception while writing. deleting partial database & re-raising exception. 🌋"
+            f"{timestr()} exception while writing. deleting partial database & re-raising exception. 🌋"
         )
         drop_database(engine.url)
         raise e
@@ -949,25 +949,25 @@ def run(date, low_storage, use_database, database_url, low_memory, delete_databa
                     write_to_database(executor, revisions)
                 else:
                     write_to_csv(revisions)
-                print(f"{strtime()} program complete. 💐")
+                print(f"{timestr()} program complete. 💐")
                 complete = True
             except Exception as e:
                 if getattr(e, "errno", None) == errno.ENOSPC:
-                    print(f"{strtime()} no space left on device. Ending program. 😲")
+                    print(f"{timestr()} no space left on device. Ending program. 😲")
                     raise e
                 elif isinstance(e, DatabaseAlreadyExists):
                     print(
-                        f"{strtime()} there is already a local version of the database. Doing nothing. HELP: to "
+                        f"{timestr()} there is already a local version of the database. Doing nothing. HELP: to "
                         f"overwrite database, use --delete-database flag. 🌅"
                     )
                     raise e
                 SLEEP_SECONDS = 5 * 60
                 print(traceback.format_exc())
                 print(
-                    f"{strtime()} caught exception ({e}). Sleeping {SLEEP_SECONDS/60} minutes..."
+                    f"{timestr()} caught exception ({e}). Sleeping {SLEEP_SECONDS/60} minutes..."
                 )
                 time.sleep(SLEEP_SECONDS)
-                print(f"{strtime()} Restarting...")
+                print(f"{timestr()} Restarting...")
             finally:
                 for fname in ["verified_files.txt", "canonical_hashes.txt"]:
                     if os.path.exists(fname):
