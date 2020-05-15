@@ -8,7 +8,7 @@ import xml.etree.ElementTree as ET
 import time
 import errno
 import traceback
-from concurrent.futures import ThreadPoolExecutor, Executor, Future
+from concurrent.futures import ThreadPoolExecutor, Executor, Future, TimeoutError
 from functools import partial
 from typing import Optional, Callable, Dict, Generator, Iterable, Tuple, TypeVar, Any
 import hashlib
@@ -24,23 +24,19 @@ def strtime() -> str:
     return datetime.datetime.now().isoformat()
 
 
-def download_update_file(session: requests.Session, url: str) -> str:
-    def _download():
-        resp = session.get(url, stream=True, timeout=60)
-        assert resp.status_code == 200
-        print(f"{strtime()} response for {url}: {resp.status_code}. 🕺")
-        with open(filename, "wb") as file:
-            i = 0
-            for chunk in resp.iter_content(chunk_size=CHUNK_SIZE):
-                file.write(chunk)
-                i += 1
-                if i % 25000 == 0:
-                    print(
-                        f"{strtime()} {filename}: received chunk #{i} "
-                        f"({round(i * CHUNK_SIZE / (1024 * 1024 * 1024), 3)} GB downloaded)... ⚡"
-                    )
+def download_update_file(executor: Executor, session: requests.Session, url: str) -> str:
+    def _stream(resp, file) -> bool:
+        CHUNK_SIZE = 1024 * 1024 * 5
+        chunks = resp.iter_content(chunk_size=CHUNK_SIZE)
 
-    CHUNK_SIZE = 2048
+        exhausted = Exhausted()
+        while True:
+            future = executor.submit(next, chunks, exhausted)
+            result = future.result(60 * 5)
+            if result is exhausted:
+                return True
+            file.write(result)
+
     filename = url.split("/")[-1]
     print(f"{strtime()} downloading {url}. saving to {filename}. 📁")
     retries = 0
@@ -49,13 +45,20 @@ def download_update_file(session: requests.Session, url: str) -> str:
             if os.path.exists(filename):
                 print(f"{strtime()} using local file {filename} 👩‍🌾")
                 break
-            _download()
+            resp = session.get(url, stream=True, timeout=60)
+            assert resp.status_code == 200
+            print(f"{timestr()} response for {url}: {resp.status_code}. 🕺")
+            with open(filename, "wb") as file:
+                complete = False
+                while not complete:
+                    complete = _stream(resp, file)
             break
-        except requests.exceptions.Timeout:
+        except (requests.exceptions.Timeout, TimeoutError):
             retries += 1
             print(
-                f"{strtime()} timeout for {url}: restarting download... (retry #{retries}) ↩️"
+                f"{strtime()} timeout for {url}: sleeping 60 seconds and restarting download... (retry #{retries}) ↩️"
             )
+            time.sleep(60)
     return filename
 
 
@@ -721,15 +724,18 @@ def download_and_parse_files(executor: Executor,) -> Generator[Dict, None, None]
     )
 
     # download & process the history files
-    download_update_file_using_session = partial(download_update_file, session)
+    download_update_file_using_session = partial(download_update_file, executor, session)
     if config["low_storage"]:
-        print(f"{strtime()} low storage mode active.")
-        file_and_url = map(
-            lambda update_url: (
-                download_update_file_using_session(update_url),
-                update_url,
-            ),
-            updates_urls,
+        print(f"{timestr()} low storage mode active.")
+        file_and_url = peek_ahead(
+            executor,
+            map(
+                lambda update_url: (
+                    download_update_file_using_session(update_url),
+                    update_url,
+                ),
+                updates_urls,
+            )
         )
     else:
         file_and_url = incremental_executor_map(
