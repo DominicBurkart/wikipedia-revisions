@@ -26,7 +26,7 @@ def strtime() -> str:
 
 
 def download_update_file(session: requests.Session, url: str) -> str:
-    @timeout_decorator.timeout(60 * 60 * 24, timeout_exception=requests.exceptions.Timeout)
+    @timeout_decorator.timeout(60 * 60 * 24, use_signals=False, timeout_exception=requests.exceptions.Timeout)
     def _download():
         resp = session.get(url, stream=True, timeout=60)
         assert resp.status_code == 200
