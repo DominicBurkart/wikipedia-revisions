@@ -16,6 +16,7 @@ import threading
 
 import requests
 import click
+import timeout_decorator
 
 config = dict()
 
@@ -25,6 +26,7 @@ def strtime() -> str:
 
 
 def download_update_file(session: requests.Session, url: str) -> str:
+    @timeout_decorator.timeout(60 * 60 * 24, timeout_exception=requests.exceptions.Timeout)
     def _download():
         resp = session.get(url, stream=True, timeout=60)
         assert resp.status_code == 200
@@ -54,8 +56,9 @@ def download_update_file(session: requests.Session, url: str) -> str:
         except requests.exceptions.Timeout:
             retries += 1
             print(
-                f"{strtime()} timeout for {url}: restarting download... (retry #{retries}) ↩️"
+                f"{strtime()} timeout for {url}: sleeping 60 seconds and restarting download... (retry #{retries}) ↩️"
             )
+            time.sleep(60)
     return filename
 
 
