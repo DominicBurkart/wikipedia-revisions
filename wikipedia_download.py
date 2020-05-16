@@ -696,7 +696,6 @@ def full_dump_url_from_partial(partial: str):
 
 def download_and_parse_files(executor: Executor,) -> Generator[Dict, None, None]:
     # todo automatically find the last completed bz2 history job
-    print(f"{timestr()} program started. 👋")
     print(f"{timestr()} requesting dump directory... 📚")
     session = requests.Session()
     session.headers.update(
@@ -936,6 +935,8 @@ def run(date, low_storage, use_database, database_url, low_memory, delete_databa
     config["database_url"] = database_url
     config["low_memory"] = low_memory
     config["delete_database"] = delete_database
+
+    print(f"{timestr()} program started. 👋")
 
     with ThreadPoolExecutor(max_workers=config["max_workers"]) as executor:
         complete = False
