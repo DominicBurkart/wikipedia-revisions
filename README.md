@@ -82,4 +82,4 @@ The above information is sufficient for you to run the program. The information 
 ```sh
 cd /path/to/ssd/without/db && > nohup.out && nohup time python3 -u  /home/dominic/scripts/wikipedia-revisions-scraper/wikipedia_download.py --database --date 20200401 --low-storage --low-memory --delete-database & tail -f nohup.out 
 ```
-- the `--low-memory` option more closely couples file reading and database I/O. It also limits the number of files actively processed to 3, which might be valuable if you are hitting your I/O constraints.
+- the `--low-memory` option more closely couples file reading and database I/O. It also limits the number of files actively processed to 2, which might be valuable if you are hitting your I/O constraints.

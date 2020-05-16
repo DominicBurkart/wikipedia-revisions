@@ -198,7 +198,7 @@ def parse_downloads(
 
     # extract files with valid checksums
     file_extractors = make_extractors(filenames_and_urls, append_bad_urls)
-    chunk_size = 3 if config["low_memory"] else int(config["max_workers"] / 2)
+    chunk_size = 2 if config["low_memory"] else int(config["max_workers"] / 2)
     for case in merge_generators(executor, file_extractors, chunk_size=chunk_size):
         yield case
 
