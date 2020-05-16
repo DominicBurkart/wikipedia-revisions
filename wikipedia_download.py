@@ -16,7 +16,6 @@ import threading
 
 import requests
 import click
-import timeout_decorator
 
 config = dict()
 
