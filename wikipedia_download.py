@@ -32,7 +32,7 @@ def download_update_file(executor: Executor, session: requests.Session, url: str
         exhausted = Exhausted()
         while True:
             future = executor.submit(next, chunks, exhausted)
-            result = future.result(60 * 5)
+            result = future.result(timeout=60 * 5)
             if result is exhausted:
                 return True
             file.write(result)
@@ -49,11 +49,9 @@ def download_update_file(executor: Executor, session: requests.Session, url: str
             assert resp.status_code == 200
             print(f"{timestr()} response for {url}: {resp.status_code}. 🕺")
             with open(filename, "wb") as file:
-                complete = False
-                while not complete:
-                    complete = _stream(resp, file)
+                _stream(resp, file)
             break
-        except (requests.exceptions.Timeout, TimeoutError):
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError, TimeoutError):
             retries += 1
             print(
                 f"{timestr()} timeout for {url}: sleeping 60 seconds and restarting download... (retry #{retries}) ↩️"
