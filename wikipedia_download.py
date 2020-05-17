@@ -25,7 +25,9 @@ def timestr() -> str:
     return datetime.datetime.now().isoformat()
 
 
-def download_update_file(executor: Executor, session: requests.Session, url: str) -> str:
+def download_update_file(
+    executor: Executor, session: requests.Session, url: str
+) -> str:
     def _stream(resp, file) -> bool:
         CHUNK_SIZE = 1024 * 1024 * 5
         chunks = resp.iter_content(chunk_size=CHUNK_SIZE)
@@ -52,7 +54,11 @@ def download_update_file(executor: Executor, session: requests.Session, url: str
             with open(filename, "wb") as file:
                 _stream(resp, file)
             break
-        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError, TimeoutError):
+        except (
+            requests.exceptions.Timeout,
+            requests.exceptions.ConnectionError,
+            TimeoutError,
+        ):
             retries += 1
             print(
                 f"{timestr()} timeout for {url}: sleeping 60 seconds and restarting download... (retry #{retries}) ↩️"
@@ -722,7 +728,9 @@ def download_and_parse_files(executor: Executor,) -> Generator[Dict, None, None]
     )
 
     # download & process the history files
-    download_update_file_using_session = partial(download_update_file, executor, session)
+    download_update_file_using_session = partial(
+        download_update_file, executor, session
+    )
     if config["low_storage"]:
         print(f"{timestr()} low storage mode active.")
         file_and_url = peek_ahead(
@@ -733,7 +741,7 @@ def download_and_parse_files(executor: Executor,) -> Generator[Dict, None, None]
                     update_url,
                 ),
                 updates_urls,
-            )
+            ),
         )
     else:
         file_and_url = incremental_executor_map(
@@ -900,10 +908,12 @@ def write_to_database(executor: Executor, revisions: Iterable[Dict]) -> None:
 )
 @click.option(
     "--database-url",
-    default="postgres:///wikipedia-revisions" if platform.python_implementation() == 'CPython' else "postgresql+psycopg2cffi:///wikipedia-revisions",
+    default="postgres:///wikipedia-revisions"
+    if platform.python_implementation() == "CPython"
+    else "postgresql+psycopg2cffi:///wikipedia-revisions",
     help="Database URL to use. Defines database dialect used (any "
     "database dialect supported by SQLAlchemy should work). Ignored"
-    "if --database is not set. Default is postgres:///wikipedia-revisions on CPython, and " 
+    "if --database is not set. Default is postgres:///wikipedia-revisions on CPython, and "
     "postgresql+psycopg2cffi:///wikipedia-revisions on all other implementations (e.g. PyPy).",
 )
 @click.option(
