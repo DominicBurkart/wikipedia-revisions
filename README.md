@@ -56,7 +56,7 @@ cd wikipedia-revisions
 pypy3 -m pip install -r requirements.txt
 ```
 
-For writing to a postgres database:
+For writing to a postgres database (no other dialects supported in PyPy):
 ```sh
 git clone https://github.com/DominicBurkart/wikipedia-revisions
 cd wikipedia-revisions
