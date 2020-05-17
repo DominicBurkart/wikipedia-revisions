@@ -183,7 +183,7 @@ def parse_downloads(
     if config["low_storage"]:
         print(
             f"{timestr()} [low storage mode] "
-            f"deleting all records of previously verified files."
+            f"deleting all records of previously verified files. 🔥"
         )
         verified_files.remove_local_file_verification()
         filenames_and_urls = peek_ahead(
@@ -222,7 +222,7 @@ class VerifiedFilesRecord:
             if resp.status_code != 200:
                 print(
                     f"{timestr()} unable to get md5 hashes from wikipedia. "
-                    "Sleeping for five minutes then retrying..."
+                    "Sleeping for five minutes then retrying... 🛌"
                 )
                 time.sleep(5 * 60)
             else:
@@ -731,7 +731,7 @@ def download_and_parse_files(executor: Executor,) -> Generator[Dict, None, None]
         download_update_file, executor, session
     )
     if config["low_storage"]:
-        print(f"{timestr()} low storage mode active.")
+        print(f"{timestr()} low storage mode active. 🐈📦")
         file_and_url = peek_ahead(
             executor,
             map(
