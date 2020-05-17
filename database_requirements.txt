@@ -1,5 +1,6 @@
 -r requirements.txt
 python-dateutil==2.8.1
-psycopg2==2.8.5
+psycopg2==2.8.5 ; platform_python_implementation == "CPython"
+psycopg2cffi==1.15.2 ; platform_python_implementation != "CPython"
 SQLAlchemy==1.3.16
-SQLAlchemy-Utils==0.36.5
+git+https://github.com/DominicBurkart/sqlalchemy-utils.git@psycopg2cffi-support
