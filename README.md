@@ -33,6 +33,8 @@ goals and technical choices.
 
 ### CPython
 
+CPython is the standard Python distribution.
+
 For writing to a bz2-compressed csv file:
 ```sh
 git clone https://github.com/DominicBurkart/wikipedia-revisions
@@ -48,6 +50,8 @@ pip3 install -r database_requirements.txt
 ```
 
 ### PyPy
+
+PyPy is an alternate, faster Python distribution.
 
 For writing to a bz2-compressed csv file:
 ```sh
