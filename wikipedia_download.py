@@ -846,7 +846,9 @@ def write_to_database(executor: Executor, revisions: Iterable[Dict]) -> None:
         last_commit = None
         for revision in revisions:
             size_since_commit += (
-                sys.getsizeof(revision["text"], 1024 * 1024) # currently always less than a megabyte
+                sys.getsizeof(
+                    revision["text"], 1024 * 1024
+                )  # currently always less than a megabyte
                 + sys.getsizeof(revision["comment"], 1024 * 1024)
                 + 300
             )
