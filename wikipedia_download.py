@@ -428,7 +428,6 @@ def merge_generators(
             if chunk_size != -1 and (
                 chunk_size <= (state["n_generators"] - state["n_exhausted"])
             ):
-                print(f"{timestr()} waiting to load additional iterators...")
                 state["exhaustion_event"].wait()
                 state["exhaustion_event"].clear()
         acquired_lock.release()
