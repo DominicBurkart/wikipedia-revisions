@@ -909,13 +909,13 @@ def write_to_database(executor: Executor, revisions: Iterable[Dict]) -> None:
 )
 @click.option(
     "--database-url",
-    default="postgres:///wikipedia-revisions"
+    default="postgres:///wikipedia_revisions"
     if platform.python_implementation() == "CPython"
-    else "postgresql+psycopg2cffi:///wikipedia-revisions",
+    else "postgresql+psycopg2cffi:///wikipedia_revisions",
     help="Database URL to use. Defines database dialect used (any "
     "database dialect supported by SQLAlchemy should work). Ignored"
-    "if --database is not set. Default is postgres:///wikipedia-revisions on CPython, and "
-    "postgresql+psycopg2cffi:///wikipedia-revisions on all other implementations (e.g. PyPy).",
+    "if --database is not set. Default is postgres:///wikipedia_revisions on CPython, and "
+    "postgresql+psycopg2cffi:///wikipedia_revisions on all other implementations (e.g. PyPy).",
 )
 @click.option(
     "--low-memory/--large-memory",
