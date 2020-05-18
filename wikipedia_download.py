@@ -26,33 +26,23 @@ def timestr() -> str:
 
 
 def download_update_file(
-    executor: Executor, session: requests.Session, url: str
+        session: requests.Session, url: str
 ) -> str:
-    def _stream(resp, file) -> bool:
-        CHUNK_SIZE = 1024 * 1024 * 5
-        chunks = resp.iter_content(chunk_size=CHUNK_SIZE)
-
-        exhausted = Exhausted()
-        while True:
-            future = executor.submit(next, chunks, exhausted)
-            result = future.result(timeout=60 * 5)
-            if result is exhausted:
-                return True
-            file.write(result)
-
+    CHUNK_SIZE = 1024 * 1024 * 5
     filename = url.split("/")[-1]
-    print(f"{timestr()} downloading {url}. saving to {filename}. 📁")
     retries = 0
     while True:
         try:
             if os.path.exists(filename):
                 print(f"{timestr()} using local file {filename} 👩‍🌾")
                 break
+            print(f"{timestr()} downloading {url}. saving to {filename}. 📁")
             resp = session.get(url, stream=True, timeout=60)
             assert resp.status_code == 200
             print(f"{timestr()} response for {url}: {resp.status_code}. 🕺")
             with open(filename, "wb") as file:
-                _stream(resp, file)
+                for chunk in  resp.iter_content(chunk_size=CHUNK_SIZE):
+                    file.write(chunk)
             break
         except (
             requests.exceptions.Timeout,
@@ -728,7 +718,7 @@ def download_and_parse_files(executor: Executor,) -> Generator[Dict, None, None]
 
     # download & process the history files
     download_update_file_using_session = partial(
-        download_update_file, executor, session
+        download_update_file, session
     )
     if config["low_storage"]:
         print(f"{timestr()} low storage mode active. 🐈📦")
