@@ -810,6 +810,33 @@ def write_to_database(executor: Executor, revisions: Iterable[Dict]) -> None:
             "contributor_id": int(contributor_id_str) if contributor_id_str else None,
         }
 
+    def retype_and_size_revision(raw_revision: Dict) -> Tuple[Dict, int]:
+        """
+        This function calls the revision retype function and estimates the size of
+        a revision in memory based on the size of its text and comment.
+        """
+        revision = retype_revision(raw_revision)
+        size = (
+            len((revision.get("text") or "").encode("utf-8"))
+            + len((revision.get("comment") or "").encode("utf-8"))
+            + 300  # estimate for the remaining small fields
+        )
+        # ^ sys.getsizeof doesn't work in pypy
+        return revision, size
+
+    def commit_batch(batch):
+        session = Session()
+        session.bulk_insert_mappings(Revision, batch)
+        session.commit()
+        session.close()
+
+    retyped_revisions_and_sizes = incremental_executor_map(
+        executor,
+        lambda revision: retype_and_size_revision(revision),
+        revisions,
+        max_parallel=config["max_workers"],
+    )
+
     print(f"{timestr()} structuring database... 📐")
     engine = create_engine(config["database_url"])
     if database_exists(engine.url):
@@ -823,35 +850,29 @@ def write_to_database(executor: Executor, revisions: Iterable[Dict]) -> None:
         assert database_exists(engine.url)
         Base.metadata.create_all(engine)
         Session = sessionmaker(bind=engine)
-        session = Session()
         print(f"{timestr()} adding revisions to session... 📖")
         i = 0
-        size_since_commit = 0
-        max_size = 1024 * 1024 if config["low_memory"] else 1024 * 1024 * 1024
+        batch_size = 0
+        max_batch_size = (
+            1024 * 1024 * 500 if config["low_memory"] else 1024 * 1024 * 1024 * 2
+        )
+        # ^ 500 MB if low memory else 2 GB
         last_commit = None
-        for revision in revisions:
-            size_since_commit += (
-                sys.getsizeof(
-                    revision["text"], 1024 * 1024
-                )  # currently always less than a megabyte
-                + sys.getsizeof(revision["comment"], 1024 * 1024)
-                + 300
-            )
-            # ^ 300 is a rough estimate of the remaining field size
-            session.add(Revision(**retype_revision(revision)))
-            i += 1
-            if size_since_commit > max_size:
+        batch = []
+        for revision, revision_size in retyped_revisions_and_sizes:
+            batch.append(revision)
+            batch_size += revision_size
+            if batch_size >= max_batch_size:
                 if last_commit is not None:
                     last_commit.result()
-                last_commit = executor.submit(session.commit)
-                session = Session()
-                size_since_commit = 0
+                last_commit = executor.submit(commit_batch, batch)
+                batch = []
+            i += 1
             if i % 1000000 == 0 or i == 1:
-                print(f"{timestr()} wrote revision #{i}")
+                print(f"{timestr()} processed revision #{i}")
         print(f"{timestr()} committing session with {i} revisions... 🤝")
         if last_commit is not None:
             last_commit.result()
-        session.commit()
         print(
             f"{timestr()} revisions written to database at: {config['database_url']} 🌈"
         )
