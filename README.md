@@ -66,6 +66,7 @@ git clone https://github.com/DominicBurkart/wikipedia-revisions
 cd wikipedia-revisions
 pypy3 -m pip install -r database_requirements.txt
 ```
+__Note__: writing out to a database using PyPy may be slower than CPython.
 
 ## Use
 
@@ -108,5 +109,5 @@ The above information is sufficient for you to run the program. The information 
 - the `--low-memory` option more closely couples file reading and database I/O. It also limits the number of files actively processed to 2, which might be valuable if you are hitting your I/O constraints.
 - if writing to a database stored on an external drive, run the program in a directory on a different drive than the database (and ideally the OS). The wikidump is downloaded into the current directory, so putting them on a different disk than the output database avoids throughput and needle-moving issues. As an example configuration, here is the command that I used to process the revisions into a local postgres database using an raspberry pi 4 with two external drives (a 240gb SSD, and a 6tb spinning disk that holds the output database). The `nohup` command prevents the command from stopping if the terminal process that spawned it is closed, and the output is saved in nohup.out. The tail program outputs the contents of nohup.out to the screen for monitoring. 
 ```sh
-cd /path/to/ssd/without/db && > nohup.out && nohup time pypy3 -u  /path/to/wikipedia_download.py --database --date 20200401 --low-storage --low-memory --delete-database & tail -f nohup.out 
+cd /path/to/ssd/without/db && > nohup.out && nohup time python3 -u  /path/to/wikipedia_download.py --database --date 20200401 --low-storage --low-memory --delete-database & tail -f nohup.out 
 ```
