@@ -105,6 +105,7 @@ custom database url must point to a postgres database and start with
 ## Configuration Notes
 The above information is sufficient for you to run the program. The information below is useful for optimization.
 
+- if you're using an SSD, set the concurrent-reads to a higher number (e.g. 1.5 times the number of CPU cores).
 - this program is I/O heavy and relies on the OS's [page cache](https://en.wikipedia.org/wiki/Page_cache). Having a few gigabytes of free memory for the cache to use will improve I/O throughput.
 - using an SSD provides substantial benefits for this program, by increasing I/O speed and eliminating needle-moving cost.
 - the `--low-memory` option more closely couples file reading and database I/O. It also limits the number of files actively processed to 2, which might be valuable if you are hitting your I/O constraints.

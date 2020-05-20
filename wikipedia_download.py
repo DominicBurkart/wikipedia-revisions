@@ -191,7 +191,7 @@ def parse_downloads(
 
     # extract files with valid checksums
     file_extractors = make_extractors(filenames_and_urls, append_bad_urls)
-    chunk_size = 2 if config["low_memory"] else int(config["max_workers"] / 2)
+    chunk_size = config["concurrent_reads"]
     for case in merge_generators(executor, file_extractors, chunk_size=chunk_size):
         yield case
 
@@ -834,7 +834,7 @@ def write_to_database(executor: Executor, revisions: Iterable[Dict]) -> None:
         executor,
         lambda revision: retype_and_size_revision(revision),
         revisions,
-        max_parallel=config["max_workers"],
+        max_parallel=config["max_workers"] * (3 / 4),
     )
 
     print(f"{timestr()} structuring database... 📐")
@@ -854,19 +854,22 @@ def write_to_database(executor: Executor, revisions: Iterable[Dict]) -> None:
         i = 0
         batch_size = 0
         max_batch_size = (
-            1024 * 1024 * 500 if config["low_memory"] else 1024 * 1024 * 1024 * 2
+            1024 * 1024 * 100 if config["low_memory"] else 1024 * 1024 * 1024 * 2
         )
-        # ^ 500 MB if low memory else 2 GB
+        # ^ 100 MB if low memory else 2 GB
         last_commit = None
         batch = []
         for revision, revision_size in retyped_revisions_and_sizes:
             batch.append(revision)
             batch_size += revision_size
             if batch_size >= max_batch_size:
+                # max two batch writes open at a time
+                next_commit = executor.submit(commit_batch, batch)
                 if last_commit is not None:
                     last_commit.result()
-                last_commit = executor.submit(commit_batch, batch)
                 batch = []
+                batch_size = 0
+                last_commit = next_commit
             i += 1
             if i % 1000000 == 0 or i == 1:
                 print(f"{timestr()} processed revision #{i}")
@@ -941,7 +944,15 @@ def write_to_database(executor: Executor, revisions: Iterable[Dict]) -> None:
     help="drop everything in the passed database and overwrite it with "
     "the wikipedia revisions data.",
 )
-def run(date, low_storage, use_database, database_url, low_memory, delete_database):
+@click.option(
+    "--concurrent-reads",
+    "concurrent_reads",
+    default=2,
+    type=int,
+    help="number of concurrently processed .xml.bz2 files. Default is 2. When using storage media "
+         "with fast concurrent reads and high throughput (SSDs), higher values are better."
+)
+def run(date, low_storage, use_database, database_url, low_memory, delete_database, concurrent_reads):
     config["date"] = date
     config["dump_page_url"] = f"https://dumps.wikimedia.org/enwiki/{date}/"
     config[
@@ -952,6 +963,9 @@ def run(date, low_storage, use_database, database_url, low_memory, delete_databa
     config["database_url"] = database_url
     config["low_memory"] = low_memory
     config["delete_database"] = delete_database
+    config["concurrent_reads"] = concurrent_reads
+    if concurrent_reads < 1:
+        raise ValueError("concurrent_reads must be at least 1.")
 
     print(f"{timestr()} program started. 👋")
 
