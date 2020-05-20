@@ -25,9 +25,7 @@ def timestr() -> str:
     return datetime.datetime.now().isoformat()
 
 
-def download_update_file(
-        session: requests.Session, url: str
-) -> str:
+def download_update_file(session: requests.Session, url: str) -> str:
     CHUNK_SIZE = 1024 * 1024 * 5
     filename = url.split("/")[-1]
     retries = 0
@@ -41,7 +39,7 @@ def download_update_file(
             assert resp.status_code == 200
             print(f"{timestr()} response for {url}: {resp.status_code}. 🕺")
             with open(filename, "wb") as file:
-                for chunk in  resp.iter_content(chunk_size=CHUNK_SIZE):
+                for chunk in resp.iter_content(chunk_size=CHUNK_SIZE):
                     file.write(chunk)
             break
         except (
@@ -717,9 +715,7 @@ def download_and_parse_files(executor: Executor,) -> Generator[Dict, None, None]
     )
 
     # download & process the history files
-    download_update_file_using_session = partial(
-        download_update_file, session
-    )
+    download_update_file_using_session = partial(download_update_file, session)
     if config["low_storage"]:
         print(f"{timestr()} low storage mode active. 🐈📦")
         file_and_url = peek_ahead(
