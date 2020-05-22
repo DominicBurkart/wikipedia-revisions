@@ -747,8 +747,10 @@ def download_and_parse_files(executor: Executor,) -> Generator[Dict, None, None]
         yield revision
 
 
-def write_to_csv(revisions: Iterable[Dict]) -> None:
-    with bz2.open("revisions.csv.bz2", "wt", newline="") as output_file:
+def write_to_csv(outfile: str, revisions: Iterable[Dict]) -> None:
+    if os.path.exists(outfile):
+        print(f"overwriting file {outfile}... 🤤")
+    with bz2.open(outfile, "wt", newline="") as output_file:
         writer = csv.DictWriter(
             output_file,
             [
@@ -932,6 +934,13 @@ def write_to_database(executor: Executor, revisions: Iterable[Dict]) -> None:
     "--database-url) to be available.",
 )
 @click.option(
+    "-o",
+    "--output",
+    "output_file",
+    default=os.path.join(os.path.curdir, "revisions.csv.bz2"),
+    help="set output path for csv.bz2. Defaults to revisions.csv.bz2 in current directory.",
+)
+@click.option(
     "--database-url",
     default="postgres:///wikipedia_revisions"
     if platform.python_implementation() == "CPython"
@@ -979,6 +988,7 @@ def run(
     date,
     low_storage,
     use_database,
+    output_file,
     database_url,
     low_memory,
     delete_database,
@@ -1013,7 +1023,7 @@ def run(
                 if use_database:
                     write_to_database(executor, revisions)
                 else:
-                    write_to_csv(revisions)
+                    write_to_csv(output_file, revisions)
                 print(f"{timestr()} program complete. 💐")
                 complete = True
             except Exception as e:
