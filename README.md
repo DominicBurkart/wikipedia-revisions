@@ -51,7 +51,8 @@ pip3 install -r database_requirements.txt
 
 ### PyPy
 
-PyPy is an alternate, faster Python distribution.
+PyPy is an alternate, faster Python distribution. Note that setting 
+up PyPy may require external dependencies.
 
 For writing to a bz2-compressed csv file:
 ```sh
@@ -107,7 +108,7 @@ The above information is sufficient for you to run the program. The information 
 - this program is I/O heavy and relies on the OS's [page cache](https://en.wikipedia.org/wiki/Page_cache). Having a few gigabytes of free memory for the cache to use will improve I/O throughput.
 - using an SSD provides substantial benefits for this program, by increasing I/O speed and eliminating needle-moving cost.
 - the `--low-memory` option more closely couples file reading and database I/O. It also limits the number of files actively processed to 2, which might be valuable if you are hitting your I/O constraints.
-- if writing to a database stored on an external drive, run the program in a directory on a different drive than the database (and ideally the OS). The wikidump is downloaded into the current directory, so putting them on a different disk than the output database avoids throughput and needle-moving issues. As an example configuration, here is the command that I used to process the revisions into a local postgres database using an raspberry pi 4 with two external drives (a 240gb SSD, and a 6tb spinning disk that holds the output database). The `nohup` command prevents the command from stopping if the terminal process that spawned it is closed, and the output is saved in nohup.out. The tail program outputs the contents of nohup.out to the screen for monitoring. 
+- if writing to a database stored on an external drive, run the program in a directory on a different drive than the database (and ideally the OS/swap). The wikidump is downloaded into the current directory, so putting them on a different disk than the output database avoids throughput and needle-moving issues. As an example configuration, here is the command that I used to process the revisions into a local postgres database using two external drives (an SSD, and a larger HDD that holds the output database). The `nohup` command prevents the command from stopping if the terminal process that spawned it is closed, and the output is saved in nohup.out. The tail program outputs the contents of nohup.out to the screen for monitoring. 
 ```sh
-cd /path/to/ssd/without/db && > nohup.out && nohup time python3 -u  /path/to/wikipedia_download.py --database --date 20200401 --low-storage --low-memory --delete-database & tail -f nohup.out 
+cd /path/to/ssd/without/db && > nohup.out && nohup time pypy3 -u /path/to/wikipedia_download.py --database --date 20200401 --low-storage --low-memory --delete-database & tail -f nohup.out 
 ```
