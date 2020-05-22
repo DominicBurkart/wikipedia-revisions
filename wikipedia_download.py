@@ -2,13 +2,12 @@ import bz2
 import csv
 import datetime
 import os
-import sys
 import re
 import xml.etree.ElementTree as ET
 import time
 import errno
 import traceback
-from concurrent.futures import ThreadPoolExecutor, Executor, Future, TimeoutError
+from concurrent.futures import ThreadPoolExecutor, Executor, Future
 from functools import partial
 from typing import Optional, Callable, Dict, Generator, Iterable, Tuple, TypeVar, Any
 import hashlib
@@ -42,11 +41,7 @@ def download_update_file(session: requests.Session, url: str) -> str:
                 for chunk in resp.iter_content(chunk_size=CHUNK_SIZE):
                     file.write(chunk)
             break
-        except (
-            requests.exceptions.Timeout,
-            requests.exceptions.ConnectionError,
-            TimeoutError,
-        ):
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError):
             retries += 1
             print(
                 f"{timestr()} timeout for {url}: sleeping 60 seconds and restarting download... (retry #{retries}) ↩️"
@@ -186,12 +181,12 @@ def parse_downloads(
             executor,
             lambda tup: (check_hash(verified_files, tup[0]), tup[1]),
             download_file_and_url,
-            max_parallel=config["max_workers"],
+            max_parallel=os.cpu_count() or 4,
         )
 
     # extract files with valid checksums
     file_extractors = make_extractors(filenames_and_urls, append_bad_urls)
-    chunk_size = 2 if config["low_memory"] else int(config["max_workers"] / 2)
+    chunk_size = config["concurrent_reads"]
     for case in merge_generators(executor, file_extractors, chunk_size=chunk_size):
         yield case
 
@@ -368,6 +363,9 @@ class Waiter:
             return False
         with self._waiter.lock:
             return self._waiter.n_pending == 0 and len(self.prior_completed) == 0
+
+    def n_pending(self) -> int:
+        return self._waiter.n_pending
 
 
 def test_waiter():
@@ -568,7 +566,7 @@ T = TypeVar("T")
 
 def peek_ahead(executor: Executor, iterable: Iterable[T]) -> Iterable[T]:
     """
-    asynchronously computes the next value of an iterable
+    computes the next value of an iterable in a different threads
 
     :param executor:
     :param iterable:
@@ -595,7 +593,8 @@ def incremental_executor_map(
     executor: Executor,
     function: Callable[[FnInputType], FnOutputType],
     function_inputs: Iterable[FnInputType],
-    max_parallel=os.cpu_count() or 4,
+    max_parallel: int = os.cpu_count() or 4,
+    max_backlog: int = -1,
 ) -> Generator[FnOutputType, None, None]:
     """
     Works like executor.map, but sacrifices efficient, grouped thread assignment for eagerness.
@@ -604,6 +603,13 @@ def incremental_executor_map(
     :param max_parallel: Number of parallel jobs to run. Should be greater than zero.
     :return: A generator of the unordered results of the mapping.
     """
+    if max_parallel < 1:
+        raise ValueError(
+            f"max_parallel is not greater than or equal to one: {max_parallel}"
+        )
+
+    exhausted = Exhausted()
+    waiter = Waiter()
 
     def load(
         executor: Executor,
@@ -611,12 +617,15 @@ def incremental_executor_map(
         function: Callable[[FnInputType], FnOutputType],
         function_inputs: Iterable[FnInputType],
         max_parallel: int,
+        max_backlog: int,
         exhausted: Exhausted,
         acquired_lock: threading.Lock,
     ):
         load_complete = False
         while not load_complete:
-            while waiter._waiter.n_pending < max_parallel:
+            while waiter._waiter.n_pending < max_parallel and (
+                max_backlog == -1 or waiter.n_pending() < max_backlog
+            ):
                 next_input = next(function_inputs, exhausted)
                 if next_input is not exhausted:
                     new_future = executor.submit(function, next_input)
@@ -628,14 +637,6 @@ def incremental_executor_map(
                 waiter._waiter.event.wait(20 * 60)
         acquired_lock.release()
 
-    if max_parallel < 1:
-        raise ValueError(
-            f"max_parallel is not greater than or equal to one: {max_parallel}"
-        )
-
-    exhausted = Exhausted()
-    waiter = Waiter()
-
     waiter.completion_lock.acquire()
     loader = executor.submit(
         lambda t: load(*t),
@@ -645,6 +646,7 @@ def incremental_executor_map(
             function,
             iter(function_inputs),
             max_parallel,
+            max_backlog,
             exhausted,
             waiter.completion_lock,
         ),
@@ -717,7 +719,7 @@ def download_and_parse_files(executor: Executor,) -> Generator[Dict, None, None]
     # download & process the history files
     download_update_file_using_session = partial(download_update_file, session)
     if config["low_storage"]:
-        print(f"{timestr()} low storage mode active. 🐈📦")
+        print(f"{timestr()} low storage mode active. 🐈 📦")
         file_and_url = peek_ahead(
             executor,
             map(
@@ -810,6 +812,40 @@ def write_to_database(executor: Executor, revisions: Iterable[Dict]) -> None:
             "contributor_id": int(contributor_id_str) if contributor_id_str else None,
         }
 
+    def retype_and_size_revision(raw_revision: Dict) -> Tuple[Dict, int]:
+        """
+        This function calls the revision retype function and estimates the size of
+        a revision in memory based on the size of its text and comment.
+        """
+        revision = retype_revision(raw_revision)
+        size = (
+            len((revision.get("text") or "").encode("utf-8"))
+            + len((revision.get("comment") or "").encode("utf-8"))
+            + 300  # estimate for the remaining small fields
+        )
+        # ^ sys.getsizeof doesn't work in pypy
+        return revision, size
+
+    def commit_batch(batch):
+        session = Session()
+        session.bulk_insert_mappings(Revision, batch)
+        session.commit()
+        session.close()
+
+    def multi_insert(engine, batch):
+        engine.dispose()
+        # we need to call this dispose when using the engine in multiple threads.
+        # more info: https://docs.sqlalchemy.org/en/13/core/pooling.html#pooling-multiprocessing
+        engine.execute(Revision.__table__.insert(), batch)
+
+    retyped_revisions_and_sizes = incremental_executor_map(
+        executor,
+        lambda revision: retype_and_size_revision(revision),
+        revisions,
+        max_parallel=os.cpu_count(),
+        max_backlog=100,
+    )
+
     print(f"{timestr()} structuring database... 📐")
     engine = create_engine(config["database_url"])
     if database_exists(engine.url):
@@ -823,35 +859,37 @@ def write_to_database(executor: Executor, revisions: Iterable[Dict]) -> None:
         assert database_exists(engine.url)
         Base.metadata.create_all(engine)
         Session = sessionmaker(bind=engine)
-        session = Session()
         print(f"{timestr()} adding revisions to session... 📖")
         i = 0
-        size_since_commit = 0
-        max_size = 1024 * 1024 if config["low_memory"] else 1024 * 1024 * 1024
+        batch_size = 0
+        max_batch_size = (
+            1024 * 1024 * 100 if config["low_memory"] else 1024 * 1024 * 1024 * 2
+        )
+        # ^ 100 MB if low memory else 2 GB
         last_commit = None
-        for revision in revisions:
-            size_since_commit += (
-                sys.getsizeof(
-                    revision["text"], 1024 * 1024
-                )  # currently always less than a megabyte
-                + sys.getsizeof(revision["comment"], 1024 * 1024)
-                + 300
-            )
-            # ^ 300 is a rough estimate of the remaining field size
-            session.add(Revision(**retype_revision(revision)))
-            i += 1
-            if size_since_commit > max_size:
+        batch = []
+        for revision, revision_size in retyped_revisions_and_sizes:
+            batch.append(revision)
+            batch_size += revision_size
+            if batch_size >= max_batch_size:
+                if config["insert_multiple_values"]:
+                    next_commit = executor.submit(multi_insert, engine, batch)
+                else:
+                    next_commit = executor.submit(commit_batch, batch)
+
+                # max two DB writes open at a time
                 if last_commit is not None:
                     last_commit.result()
-                last_commit = executor.submit(session.commit)
-                session = Session()
-                size_since_commit = 0
+                batch = []
+                batch_size = 0
+                last_commit = next_commit
+                del next_commit
+            i += 1
             if i % 1000000 == 0 or i == 1:
-                print(f"{timestr()} wrote revision #{i}")
+                print(f"{timestr()} processed revision #{i}")
         print(f"{timestr()} committing session with {i} revisions... 🤝")
         if last_commit is not None:
             last_commit.result()
-        session.commit()
         print(
             f"{timestr()} revisions written to database at: {config['database_url']} 🌈"
         )
@@ -920,21 +958,51 @@ def write_to_database(executor: Executor, revisions: Iterable[Dict]) -> None:
     help="drop everything in the passed database and overwrite it with "
     "the wikipedia revisions data.",
 )
-def run(date, low_storage, use_database, database_url, low_memory, delete_database):
+@click.option(
+    "--concurrent-reads",
+    "concurrent_reads",
+    default=2,
+    type=int,
+    help="number of concurrently processed .xml.bz2 files. Default is 2. When using storage media "
+    "with fast concurrent reads and high throughput (SSDs), higher values (e.g. the number of "
+    "cpu cores) are better.",
+)
+@click.option(
+    "--insert-multiple-values/--batch-insert",
+    "insert_multiple_values",
+    default=False,
+    help="if writing to a database, insert multiple values within a single statement. Not supported for all "
+    "SQLAlchemy-covered databases. For more information on multi-value inserts in SQLAlchemy, see: "
+    "http://docs.sqlalchemy.org/en/latest/core/dml.html#sqlalchemy.sql.expression.Insert.values.params.*args",
+)
+def run(
+    date,
+    low_storage,
+    use_database,
+    database_url,
+    low_memory,
+    delete_database,
+    concurrent_reads,
+    insert_multiple_values,
+):
     config["date"] = date
     config["dump_page_url"] = f"https://dumps.wikimedia.org/enwiki/{date}/"
     config[
         "md5_hashes_url"
     ] = f"https://dumps.wikimedia.org/enwiki/{date}/enwiki-{date}-md5sums.txt"
-    config["max_workers"] = (os.cpu_count() or 4) * 2
     config["low_storage"] = low_storage
     config["database_url"] = database_url
     config["low_memory"] = low_memory
     config["delete_database"] = delete_database
+    config["concurrent_reads"] = concurrent_reads
+    config["insert_multiple_values"] = insert_multiple_values
+
+    if concurrent_reads < 1:
+        raise ValueError("concurrent_reads must be at least 1.")
 
     print(f"{timestr()} program started. 👋")
 
-    with ThreadPoolExecutor(max_workers=config["max_workers"]) as executor:
+    with ThreadPoolExecutor() as executor:
         complete = False
         while not complete:
             try:
