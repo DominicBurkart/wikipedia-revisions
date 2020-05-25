@@ -336,8 +336,8 @@ class Waiter:
             if future.done():
                 self.prior_completed.add(future)
             else:
-                future._waiters.append(self._waiter)
                 with self._waiter.lock:
+                    future._waiters.append(self._waiter)
                     self._waiter.n_pending += 1
 
     def as_completed(self) -> Generator[Any, None, None]:
@@ -349,14 +349,15 @@ class Waiter:
         while not self.done():
             while len(self.prior_completed) > 0:
                 yield self.prior_completed.pop().result()
-            self._waiter.event.wait(20 * 60)
-            finished = self._waiter.collect_finished()
-            while len(finished) > 0:
-                yield process_future(finished.pop())
+            if not self.done():
+                self._waiter.event.wait()
+                finished_futures = self._waiter.collect_finished()
+                for future in finished_futures:
+                    yield process_future(future)
 
         stragglers = self._waiter.collect_finished()
-        while len(stragglers) > 0:
-            yield process_future(stragglers.pop())
+        for straggler in stragglers:
+            yield process_future(straggler)
 
     def done(self) -> bool:
         if self.completion_lock.locked():
@@ -364,8 +365,9 @@ class Waiter:
         with self._waiter.lock:
             return self._waiter.n_pending == 0 and len(self.prior_completed) == 0
 
-    def n_pending(self) -> int:
-        return self._waiter.n_pending
+    def n_uncollected(self) -> int:
+        with self._waiter.lock:
+            return self._waiter.n_pending + len(self._waiter.finished_futures)
 
 
 def test_waiter():
@@ -431,10 +433,10 @@ def merge_generators(
     # yield values as they are completed & request next generator value
     for (value, generator) in waiter.as_completed():
         if value is not exhausted:
-            yield value
             waiter.add(
                 executor.submit(lambda gen: (next(gen, exhausted), gen), generator)
             )
+            yield value
         else:
             state["n_exhausted"] += 1
             state["exhaustion_event"].set()
@@ -585,6 +587,11 @@ def peek_ahead(executor: Executor, iterable: Iterable[T]) -> Iterable[T]:
     del next_future
 
 
+def test_peek_ahead():
+    with ThreadPoolExecutor() as ex:
+        assert list(range(10)) == list(peek_ahead(ex, iter(range(10))))
+
+
 FnInputType = TypeVar("FnInputType")
 FnOutputType = TypeVar("FnOutputType")
 
@@ -623,8 +630,9 @@ def incremental_executor_map(
     ):
         load_complete = False
         while not load_complete:
-            while waiter._waiter.n_pending < max_parallel and (
-                max_backlog == -1 or waiter.n_pending() < max_backlog
+            n_uncollected = waiter.n_uncollected()
+            while n_uncollected < max_parallel and (
+                (max_backlog == -1) or (n_uncollected < max_backlog)
             ):
                 next_input = next(function_inputs, exhausted)
                 if next_input is not exhausted:
@@ -634,7 +642,7 @@ def incremental_executor_map(
                     load_complete = True
                     break
             if not load_complete:
-                waiter._waiter.event.wait(20 * 60)
+                waiter._waiter.event.wait(timeout=5)
         acquired_lock.release()
 
     waiter.completion_lock.acquire()
@@ -655,6 +663,12 @@ def incremental_executor_map(
         yield result
 
     assert loader.done()
+
+
+def test_incremental_executor_map():
+    with ThreadPoolExecutor() as ex:
+        out = incremental_executor_map(ex, lambda x: x, range(5))
+        assert set(out) == set(range(5))
 
 
 def lazy_dezip(it: Iterable[Tuple]) -> Iterable[Iterable]:
@@ -840,12 +854,14 @@ def write_to_database(executor: Executor, revisions: Iterable[Dict]) -> None:
         # more info: https://docs.sqlalchemy.org/en/13/core/pooling.html#pooling-multiprocessing
         engine.execute(Revision.__table__.insert(), batch)
 
+    max_batch_size = 1024 * 1024 * 100 if config["low_memory"] else 1024 * 1024 * 1024
+
     retyped_revisions_and_sizes = incremental_executor_map(
         executor,
         lambda revision: retype_and_size_revision(revision),
         revisions,
         max_parallel=os.cpu_count(),
-        max_backlog=100,
+        max_backlog=int(max_batch_size / (1024 * 1024)),
     )
 
     print(f"{timestr()} structuring database... 📐")
@@ -864,10 +880,6 @@ def write_to_database(executor: Executor, revisions: Iterable[Dict]) -> None:
         print(f"{timestr()} adding revisions to session... 📖")
         i = 0
         batch_size = 0
-        max_batch_size = (
-            1024 * 1024 * 100 if config["low_memory"] else 1024 * 1024 * 1024 * 2
-        )
-        # ^ 100 MB if low memory else 2 GB
         last_commit = None
         batch = []
         for revision, revision_size in retyped_revisions_and_sizes:
