@@ -336,8 +336,8 @@ class Waiter:
             if future.done():
                 self.prior_completed.add(future)
             else:
-                future._waiters.append(self._waiter)
                 with self._waiter.lock:
+                    future._waiters.append(self._waiter)
                     self._waiter.n_pending += 1
 
     def as_completed(self) -> Generator[Any, None, None]:
@@ -349,10 +349,11 @@ class Waiter:
         while not self.done():
             while len(self.prior_completed) > 0:
                 yield self.prior_completed.pop().result()
-            self._waiter.event.wait(20 * 60)
-            finished = self._waiter.collect_finished()
-            while len(finished) > 0:
-                yield process_future(finished.pop())
+            if not self.done():
+                self._waiter.event.wait()
+                finished = self._waiter.collect_finished()
+                for future in finished:
+                    yield process_future(future)
 
         stragglers = self._waiter.collect_finished()
         while len(stragglers) > 0:
@@ -364,8 +365,9 @@ class Waiter:
         with self._waiter.lock:
             return self._waiter.n_pending == 0 and len(self.prior_completed) == 0
 
-    def n_pending(self) -> int:
-        return self._waiter.n_pending
+    def n_uncollected(self) -> int:
+        with self._waiter.lock:
+            return self._waiter.n_pending + len(self._waiter.finished_futures)
 
 
 def test_waiter():
@@ -431,10 +433,10 @@ def merge_generators(
     # yield values as they are completed & request next generator value
     for (value, generator) in waiter.as_completed():
         if value is not exhausted:
-            yield value
             waiter.add(
                 executor.submit(lambda gen: (next(gen, exhausted), gen), generator)
             )
+            yield value
         else:
             state["n_exhausted"] += 1
             state["exhaustion_event"].set()
@@ -585,6 +587,11 @@ def peek_ahead(executor: Executor, iterable: Iterable[T]) -> Iterable[T]:
     del next_future
 
 
+def test_peek_ahead():
+    with ThreadPoolExecutor() as ex:
+        assert list(range(10)) == list(peek_ahead(ex, iter(range(10))))
+
+
 FnInputType = TypeVar("FnInputType")
 FnOutputType = TypeVar("FnOutputType")
 
@@ -623,8 +630,8 @@ def incremental_executor_map(
     ):
         load_complete = False
         while not load_complete:
-            while waiter._waiter.n_pending < max_parallel and (
-                max_backlog == -1 or waiter.n_pending() < max_backlog
+            while waiter.n_uncollected() < max_parallel and (
+                (max_backlog == -1) or (waiter.n_uncollected() < max_backlog)
             ):
                 next_input = next(function_inputs, exhausted)
                 if next_input is not exhausted:
@@ -655,6 +662,12 @@ def incremental_executor_map(
         yield result
 
     assert loader.done()
+
+
+def test_incremental_executor_map():
+    with ThreadPoolExecutor() as ex:
+        out = incremental_executor_map(ex, lambda x: x, range(5))
+        assert set(out) == set(range(5))
 
 
 def lazy_dezip(it: Iterable[Tuple]) -> Iterable[Iterable]:
