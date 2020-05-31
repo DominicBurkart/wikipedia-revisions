@@ -334,7 +334,8 @@ class Waiter:
     def add(self, future: Future):
         with future._condition:
             if future.done():
-                self.prior_completed.add(future)
+                with self._waiter.lock:
+                    self.prior_completed.add(future)
             else:
                 with self._waiter.lock:
                     future._waiters.append(self._waiter)
@@ -356,8 +357,8 @@ class Waiter:
                     yield process_future(future)
 
         stragglers = self._waiter.collect_finished()
-        for straggler in stragglers:
-            yield process_future(straggler)
+        for future in stragglers:
+            yield process_future(future)
 
     def done(self) -> bool:
         if self.completion_lock.locked():
@@ -584,7 +585,6 @@ def peek_ahead(executor: Executor, iterable: Iterable[T]) -> Iterable[T]:
         else:
             next_future = executor.submit(partial(next, iterable, exhausted))
             yield next_value
-    del next_future
 
 
 def test_peek_ahead():
@@ -797,9 +797,12 @@ class DatabaseAlreadyExists(Exception):
 def write_to_database(executor: Executor, revisions: Iterable[Dict]) -> None:
     from dateutil.parser import parse as parse_timestamp
     from sqlalchemy import create_engine, Column, Integer, Text, DateTime
-    from sqlalchemy.orm import sessionmaker
+    from sqlalchemy.orm import sessionmaker, scoped_session
     from sqlalchemy_utils import database_exists, create_database, drop_database
     from sqlalchemy.ext.declarative import declarative_base
+
+    SMALLBATCH = 1024
+    BIGBATCH = 5 * 1024
 
     Base = declarative_base()
 
@@ -828,40 +831,22 @@ def write_to_database(executor: Executor, revisions: Iterable[Dict]) -> None:
             "contributor_id": int(contributor_id_str) if contributor_id_str else None,
         }
 
-    def retype_and_size_revision(raw_revision: Dict) -> Tuple[Dict, int]:
-        """
-        This function calls the revision retype function and estimates the size of
-        a revision in memory based on the size of its text and comment.
-        """
-        revision = retype_revision(raw_revision)
-        size = (
-            len((revision.get("text") or "").encode("utf-8"))
-            + len((revision.get("comment") or "").encode("utf-8"))
-            + 300  # estimate for the remaining small fields
-        )
-        # ^ sys.getsizeof doesn't work in pypy
-        return revision, size
-
     def commit_batch(batch):
-        session = Session()
-        session.bulk_insert_mappings(Revision, batch)
-        session.commit()
-        session.close()
+        Session.bulk_insert_mappings(Revision, batch)
+        Session.commit()
+        Session.remove()
 
-    def multi_insert(engine, batch):
-        engine.dispose()
-        # we need to call this dispose when using the engine in multiple threads.
-        # more info: https://docs.sqlalchemy.org/en/13/core/pooling.html#pooling-multiprocessing
-        engine.execute(Revision.__table__.insert(), batch)
+    def multi_insert(batch):
+        Session.execute(Revision.__table__.insert(), batch)
+        Session.commit()
+        Session.remove()
 
-    max_batch_size = 1024 * 1024 * 100 if config["low_memory"] else 1024 * 1024 * 1024
-
-    retyped_revisions_and_sizes = incremental_executor_map(
+    retyped_revisions = incremental_executor_map(
         executor,
-        lambda revision: retype_and_size_revision(revision),
+        retype_revision,
         revisions,
         max_parallel=os.cpu_count(),
-        max_backlog=int(max_batch_size / (1024 * 1024)),
+        max_backlog=SMALLBATCH if config["low_memory"] else BIGBATCH,
     )
 
     print(f"{timestr()} structuring database... 📐")
@@ -876,34 +861,31 @@ def write_to_database(executor: Executor, revisions: Iterable[Dict]) -> None:
         create_database(engine.url)
         assert database_exists(engine.url)
         Base.metadata.create_all(engine)
-        Session = sessionmaker(bind=engine)
+        Session = scoped_session(sessionmaker(bind=engine))
         print(f"{timestr()} adding revisions to session... 📖")
         i = 0
-        batch_size = 0
+        max_batch_size = SMALLBATCH if config["low_memory"] else BIGBATCH
         last_commit = None
         batch = []
-        for revision, revision_size in retyped_revisions_and_sizes:
+        for revision in retyped_revisions:
             batch.append(revision)
-            batch_size += revision_size
-            if batch_size >= max_batch_size:
+            if len(batch) >= max_batch_size:
                 if config["insert_multiple_values"]:
-                    next_commit = executor.submit(multi_insert, engine, batch)
+                    next_commit = executor.submit(multi_insert, batch)
                 else:
                     next_commit = executor.submit(commit_batch, batch)
-
-                # max two DB writes open at a time
                 if last_commit is not None:
                     last_commit.result()
-                batch = []
-                batch_size = 0
                 last_commit = next_commit
-                del next_commit
+                batch = []
             i += 1
+            if i % max_batch_size * 2 == 0:
+                engine.dispose()
             if i % 1000000 == 0 or i == 1:
                 print(f"{timestr()} processed revision #{i}")
-        print(f"{timestr()} committing session with {i} revisions... 🤝")
         if last_commit is not None:
             last_commit.result()
+        Session.remove()
         print(
             f"{timestr()} revisions written to database at: {config['database_url']} 🌈"
         )
