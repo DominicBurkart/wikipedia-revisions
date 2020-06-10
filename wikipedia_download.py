@@ -1,40 +1,28 @@
 import bz2
 import csv
-import datetime
-import os
 import re
 import xml.etree.ElementTree as ET
 import time
 import errno
-import traceback
-import queue
-from concurrent.futures import (
-    ProcessPoolExecutor,
-    ThreadPoolExecutor,
-    Executor,
-    Future,
-    wait,
-    FIRST_COMPLETED,
-    ALL_COMPLETED,
-)
-import multiprocessing
-from functools import partial
-from typing import Optional, Callable, Dict, Generator, Iterable, Tuple, TypeVar, Any
+from typing import Optional, Dict, Generator, Iterable, Tuple, Callable
+from concurrent.futures import ThreadPoolExecutor
 import hashlib
-import threading
 import platform
-from collections import deque
-from enum import Enum
+import os
+import threading
 
 import requests
 import click
-import dill
+
+from utils import (
+    timestr,
+    peek_ahead,
+    unordered_incremental_executor_map,
+    merge_iterators,
+    LazyList,
+)
 
 config = dict()
-
-
-def timestr() -> str:
-    return datetime.datetime.now().isoformat()
 
 
 def download_update_file(session: requests.Session, url: str) -> str:
@@ -146,8 +134,11 @@ def generate_revisions(file) -> Generator[Dict, None, None]:
                 element.clear()
 
 
-def extract_one_file(filename: str) -> Generator[Dict, None, None]:
-    print(f"{timestr()} extracting revisions from update file {filename}... 🧛")
+def parse_one_file(filename: str) -> Generator[Dict, None, None]:
+    pid = os.getpid()
+    print(
+        f"{timestr()} extracting revisions from update file {filename} in process #{pid}... 🧛"
+    )
     with bz2.open(filename, "rt", newline="") as uncompressed:
         for revision in generate_revisions(uncompressed):
             yield revision
@@ -160,7 +151,7 @@ def extract_one_file(filename: str) -> Generator[Dict, None, None]:
 def verify_files(
     download_file_and_url: Iterable[Tuple[str, str]],
     append_bad_urls,
-    executor: Executor,
+    executor: ThreadPoolExecutor,
 ) -> Generator[str, None, None]:
     verified_files = VerifiedFilesRecord()
 
@@ -272,465 +263,12 @@ def check_hash(verified_files: VerifiedFilesRecord, filename: str) -> Optional[D
                 # ^ hack in low_storage mode the files are deleted when exhausted
                 verified_files.add(filename)
         else:
-            print(f"{timestr()} hash mismatch with {filename}. Deleting file.🗑️ ")
+            print(f"{timestr()} hash mismatch with {filename}. Deleting file.🗑️")
             os.remove(filename)
             return None
 
     print(f"{timestr()} {filename} hash verified 💁")
     return filename
-
-
-class Exhausted:
-    pass
-
-
-class _Waiter:
-    """
-        based on _Waiter class in concurrent.futures._base
-    """
-
-    def __init__(self):
-        self.event = threading.Event()
-        self.finished_futures = []
-        self.lock = threading.RLock()
-        self.n_pending: int = 0
-
-    def add_result(self, future):
-        with self.lock:
-            self.finished_futures.append(future)
-            self.n_pending -= 1
-        self.event.set()
-
-    def add_exception(self, future):
-        with self.lock:
-            self.finished_futures.append(future)
-            self.n_pending -= 1
-        self.event.set()
-
-    def add_cancelled(self, future):
-        with self.lock:
-            self.finished_futures.append(future)
-            self.n_pending -= 1
-        self.event.set()
-
-    def collect_finished(self):
-        with self.lock:
-            finished = self.finished_futures
-            self.finished_futures = []
-            self.event.clear()
-        return finished
-
-
-class Waiter:
-    """
-        works like concurrent.futures.as_completed, but accepts additional futures during iteration.
-        output ordering is arbitrary.
-    """
-
-    def __init__(self, futures: Iterable[Future] = []):
-        self._waiter = _Waiter()
-        self.prior_completed = set()
-        self.completion_lock = threading.Lock()
-        # ^ when acquired, prevents as_completed from stopping even if there are no running tasks.
-        for future in futures:
-            self.add(future)
-
-    def add(self, future: Future):
-        with self._waiter.lock:
-            if future.done():
-                self.prior_completed.add(future)
-            else:
-                with future._condition:
-                    future._waiters.append(self._waiter)
-                    self._waiter.n_pending += 1
-
-    def as_completed(self) -> Generator[Any, None, None]:
-        def process_future(future: Future):
-            with future._condition:
-                future._waiters.remove(self._waiter)
-                return future.result()
-
-        while not self.done():
-            while len(self.prior_completed) > 0:
-                yield self.prior_completed.pop().result()
-            if not self.done():
-                self._waiter.event.wait(timeout=5)
-                finished_futures = self._waiter.collect_finished()
-                while len(finished_futures) > 0:
-                    yield process_future(finished_futures.pop())
-
-        stragglers = self._waiter.collect_finished()
-        for future in stragglers:
-            yield process_future(future)
-
-    def done(self) -> bool:
-        if self.completion_lock.locked():
-            return False
-        return self._waiter.n_pending == 0 and len(self.prior_completed) == 0
-
-    def n_uncollected(self) -> int:
-        return (
-            self._waiter.n_pending
-            + len(self.prior_completed)
-            + len(self._waiter.finished_futures)
-        )
-
-
-def test_waiter():
-    with ThreadPoolExecutor() as e:
-        futures = [e.submit(lambda x: x, i) for i in range(10)]
-        waiter = Waiter(futures)
-        for i in range(10, 20):
-            waiter.add(e.submit(lambda x: x, i))
-        assert set(waiter.as_completed()) == set(range(20))
-
-    with ThreadPoolExecutor() as e:
-        futures = [e.submit(lambda x: x, i) for i in range(33)]
-        waiter = Waiter(futures)
-        for i in range(33, 66):
-            waiter.add(e.submit(lambda x: x, i))
-        assert set(waiter.as_completed()) == set(range(66))
-
-
-T = TypeVar("T")
-
-
-class PoolExecutor(Enum):
-    Process = "Process"
-    Thread = "Thread"
-
-
-def merge_iterators(
-    iterator_functions: Iterable[Callable[..., Iterable[T]]],
-    chunk_size: int = -1,
-    buffer: int = 10,
-    parallelization_strategy: PoolExecutor = PoolExecutor.Process,
-) -> Generator[T, None, None]:
-    """
-    Combines the output of multiple iterables into a single iterator. Since regular a iterator cannot
-    be polled from multiple threads concurrently, the number of concurrent tasks submitted by this function is at most
-    the number of iterator. Note: a separate thread is generated to poll the iterator functions and call them to
-    begin populating the output, regardless of the parallelization strategy. Results are returned eagerly. Order is
-    not guaranteed.
-
-    :param executor: executor used to increment the generators.
-    :param iterator_functions: zero-arity functions that return iterators to combine results from.
-    :param chunk_size: number of generators to poll from at once. If greater than the number of generators, ignored.
-    if -1, ignored. If zero or a negative number other than -1, raises ValueError.
-    :param buffer: max number of backlogged values.
-    :return: a generator over the combined outputs of all input generators.
-    """
-    if chunk_size < 1 and chunk_size != -1:
-        raise ValueError("chunk_size must be greater than zero or equal to negative 1.")
-    if buffer < 1:
-        raise ValueError("buffer must be greater than 0.")
-
-    def _loader(
-        queue: multiprocessing.Queue,
-        iterators: Iterable[Iterable[T]],
-        chunk_size: int = -1,
-        executor_type: PoolExecutor = PoolExecutor.Process,
-    ):
-        def _iter_spanner(
-            serialized_iterator_function: bytes, queue: multiprocessing.Queue
-        ):
-            iterator_function = dill.loads(serialized_iterator_function)
-            for value in iterator_function():
-                queue.put(value)
-
-        Executor = (
-            ProcessPoolExecutor
-            if executor_type == PoolExecutor.Process
-            else ThreadPoolExecutor
-        )
-        with Executor() as executor:
-            active_futures = set()
-            for iterator in iterators:
-                serialized_iterator = dill.dumps(iterator)
-                future = executor.submit(_iter_spanner, serialized_iterator, queue)
-                if chunk_size != -1:
-                    active_futures.add(future)
-                    while len(active_futures) >= chunk_size:
-                        complete_futures, active_futures = wait(
-                            active_futures, return_when=FIRST_COMPLETED
-                        )
-            if len(active_futures) > 0:
-                wait(active_futures, return_when=ALL_COMPLETED)
-
-    results_queue = multiprocessing.Manager().Queue(maxsize=buffer)
-    with ThreadPoolExecutor(max_workers=1) as executor:
-        loader_future = executor.submit(
-            _loader,
-            results_queue,
-            iterator_functions,
-            chunk_size,
-            parallelization_strategy,
-        )
-        while not (loader_future.done() and results_queue.empty()):
-            try:
-                yield results_queue.get(timeout=0.1)
-            except queue.Empty:
-                pass
-
-        loader_future.result()  # rethrow any error that killed the loader
-
-
-def test_merge_iterators():
-    def gen1():
-        for x in range(10):
-            yield x
-
-    def gen2():
-        for y in range(10, 20):
-            yield y
-
-    assert set(merge_iterators((gen1, gen2), 1, 1, PoolExecutor.Process)) == set(
-        range(20)
-    )
-    assert len(list(merge_iterators((gen1, gen2), 1, 1, PoolExecutor.Process))) == 20
-
-    assert set(merge_iterators([gen1, gen2], 1, 1, PoolExecutor.Thread)) == set(
-        range(20)
-    )
-    assert len(list(merge_iterators([gen1, gen2], 1, 1, PoolExecutor.Thread))) == 20
-
-
-class LazyList:
-    """
-    memorizes the results of an iterable, allowing for lazy list construction. Not thread-safe. Behavior on this is
-    not well protected.
-
-    Be careful about mutating the contents of the list.
-    """
-
-    def __init__(self, iterable: Iterable):
-        self.all = []
-        self.iterator = iter(iterable)
-        self.appended = []
-
-    def __iter__(self) -> Generator:
-        for value in self.all:
-            yield value
-        for value in self.iterator:
-            self.all.append(value)
-            yield value
-        for value in self.appended:
-            self.all.append(value)
-            yield value
-        self.appended.clear()
-
-    def __getitem__(self, item):
-        if isinstance(item, int):
-            if len(self.all) > item:
-                return self.all[item]
-            i = len(self.all)
-            for value in self.iterator:
-                self.all.append(value)
-                if i == item:
-                    return value
-                i += 1
-            for value in self.appended:
-                self.all.append(value)
-                if i == item:
-                    return value
-            self.appended.clear()
-            raise IndexError
-        elif isinstance(item, slice):
-            if item.start < 0:
-                raise IndexError
-            if item.stop < item.start:
-                raise IndexError
-            if len(self.all) < item.stop:
-                self[item.stop - 1]  # memorize necessary values
-            return self.all[item]
-        raise NotImplementedError
-
-    def append(self, value) -> None:
-        self.appended.append(value)
-
-
-def _test_fn_iden(x):
-    return x
-
-
-def _test_fn_append(appendable, v):
-    appendable.append(v)
-
-
-def test_lazy_list():
-    li = LazyList(iter([1, 2, 3]))
-    assert list(li) == [1, 2, 3]
-    assert list(li) == [1, 2, 3]
-
-    l2 = LazyList(range(1, 4))
-    for v in range(4, 7):
-        l2.append(v)
-    assert list(l2) == list(range(1, 7))
-    assert list(l2) == list(range(1, 7))
-
-    l3 = LazyList(range(10))
-    l4 = LazyList(l3)
-    assert list(l3) == list(l4)
-    assert list(l3) == list(l4)
-    l4.append(10)
-    assert list(l3) + [10] == list(l4)
-
-    l5 = LazyList(range(10))
-    for _ in l5:
-        assert list(l5) == list(range(10))
-
-    l6 = LazyList(range(2))
-    it1 = iter(l6)
-    it2 = iter(l6)
-    next(it2)
-    next(it2)  # it2 is now exhausted, but hasn't raised StopIteration yet.
-    l6.append("nice")
-    assert next(it1) == 0
-    assert next(it1) == 1
-    assert next(it1) == "nice"
-    assert next(it2) == "nice"
-    l6.append("final")
-    assert next(it1) == "final"
-    assert next(it2) == "final"
-
-
-def test_lazy_list_slicing():
-    x = LazyList(range(10))
-    assert x[4:6] == [4, 5]
-
-
-T = TypeVar("T")
-
-
-def peek_ahead(executor: Executor, iterable: Iterable[T]) -> Iterable[T]:
-    """
-    computes the next value of an iterable in a different threads
-
-    :param executor:
-    :param iterable:
-    :return:
-    """
-    is_exhausted = False
-    exhausted = Exhausted()
-    iterator = iter(iterable)
-    next_future = executor.submit(partial(next, iterator, exhausted))
-    while not is_exhausted:
-        next_value = next_future.result()
-        if next_value is exhausted:
-            is_exhausted = True
-        else:
-            next_future = executor.submit(partial(next, iterator, exhausted))
-            yield next_value
-
-
-def test_peek_ahead_iter():
-    with ThreadPoolExecutor() as ex:
-        assert list(range(10)) == list(peek_ahead(ex, iter(range(10))))
-
-
-def test_peek_ahead_range():
-    with ThreadPoolExecutor() as ex:
-        assert list(range(10)) == list(peek_ahead(ex, range(10)))
-
-
-FnInputType = TypeVar("FnInputType")
-FnOutputType = TypeVar("FnOutputType")
-
-
-def unordered_incremental_executor_map(
-    executor: Executor,
-    function: Callable[[FnInputType], FnOutputType],
-    function_inputs: Iterable[FnInputType],
-    max_parallel: int = os.cpu_count() or 4,
-    max_backlog: int = -1,
-) -> Generator[FnOutputType, None, None]:
-    """
-    Works like executor.map, but sacrifices efficient, grouped thread assignment for eagerness.
-    Runs max_parallel jobs or fewer simultaneously. Input order is NOT preserved.
-
-    :param max_parallel: Number of parallel jobs to run. Should be greater than zero.
-    :return: A generator of the unordered results of the mapping.
-    """
-    if max_parallel < 1:
-        raise ValueError(
-            f"max_parallel is not greater than or equal to one: {max_parallel}"
-        )
-
-    exhausted = Exhausted()
-    waiter = Waiter()
-
-    def load(
-        executor: Executor,
-        waiter: Waiter,
-        function: Callable[[FnInputType], FnOutputType],
-        function_inputs: Iterable[FnInputType],
-        max_parallel: int,
-        max_backlog: int,
-        exhausted: Exhausted,
-        acquired_lock: threading.Lock,
-    ):
-        load_complete = False
-        while not load_complete:
-            while waiter._waiter.n_pending < max_parallel and (
-                (max_backlog == -1) or (waiter.n_uncollected() < max_backlog)
-            ):
-                next_input = next(function_inputs, exhausted)
-                if next_input is not exhausted:
-                    new_future = executor.submit(function, next_input)
-                    waiter.add(new_future)
-                else:
-                    load_complete = True
-                    break
-            if not load_complete:
-                waiter._waiter.event.wait(timeout=30)
-        acquired_lock.release()
-
-    waiter.completion_lock.acquire()
-    loader = executor.submit(
-        lambda t: load(*t),
-        (
-            executor,
-            waiter,
-            function,
-            iter(function_inputs),
-            max_parallel,
-            max_backlog,
-            exhausted,
-            waiter.completion_lock,
-        ),
-    )
-    for result in waiter.as_completed():
-        yield result
-
-    assert loader.done()
-
-
-def test_unordered_incremental_executor_map():
-    with ThreadPoolExecutor() as ex:
-        out = unordered_incremental_executor_map(ex, lambda x: x, range(5))
-        assert set(out) == set(range(5))
-
-
-def lazy_dezip(it: Iterable[Tuple]) -> Iterable[Iterable]:
-    """
-    assumes that each tuple in the iterable has the same length. Stores the whole input in memory until the last
-    iterator is released.
-    """
-    try:
-        container = LazyList(it)
-        first = next(iter(container))
-        n_zipped = len(first)
-        return map(lambda i: (row[i] for row in container), range(n_zipped))
-    except StopIteration:
-        raise RuntimeError("lazy_dezip received an empty iterator")
-
-
-def test_lazy_dezip():
-    abc, cde, efg, hij = lazy_dezip(zip("abc", "cde", "efg", "hij"))
-    assert "".join(abc) == "abc"
-    assert "".join(cde) == "cde"
-    assert "".join(efg) == "efg"
-    assert "".join(hij) == "hij"
 
 
 def full_dump_url_from_partial(partial: str):
@@ -742,9 +280,7 @@ def full_dump_url_from_partial(partial: str):
         raise ValueError("dump page format has been updated.")
 
 
-def download_and_parse_files(
-    executor: ThreadPoolExecutor
-) -> Generator[Dict, None, None]:
+def download_and_parse_files() -> Generator[Dict, None, None]:
     # todo automatically find the last completed bz2 history job
     print(f"{timestr()} requesting dump directory... 📚")
     session = requests.Session()
@@ -772,38 +308,32 @@ def download_and_parse_files(
         )
     )
 
-    # download & process the history files
-    download_update_file_using_session = partial(download_update_file, session)
-    file_and_url = unordered_incremental_executor_map(
-        executor,
-        lambda update_url: (download_update_file_using_session(update_url), update_url),
-        updates_urls,
-        max_parallel=2,
-        max_backlog=2 if config["low_storage"] else -1,
-    )
+    with ThreadPoolExecutor() as executor:
+        # download & process the history files
+        file_and_url = unordered_incremental_executor_map(
+            executor,
+            lambda url: (download_update_file(session, url), url),
+            updates_urls,
+            max_parallel=2,
+            max_backlog=2 if config["low_storage"] else -1,
+        )
 
-    # verify files were correctly downloaded
-    verified_files = verify_files(
-        file_and_url, append_bad_urls=updates_urls, executor=executor
-    )
+        # verify files were correctly downloaded
+        verified_files = verify_files(
+            file_and_url, append_bad_urls=updates_urls, executor=executor
+        )
 
-    # create functions that read and parse valid files
-    file_extractors = (
-        partial(extract_one_file, filename) for filename in verified_files
-    )
-
-    # dispatch file extraction functions for concurrent reading.
-    for case in merge_iterators(
-        file_extractors,
-        chunk_size=config["concurrent_reads"],
-        buffer=100 if config["low_memory"] else 2000,
-    ):
-        yield case
+        # create functions that read and parse valid files
+        for filename in verified_files:
+            yield lambda: parse_one_file(filename)
 
 
-def write_to_csv(outfile: str, revisions: Iterable[Dict]) -> None:
+def write_to_csv(
+    outfile: str, revision_iterator_functions: Iterable[Callable[..., Iterable[Dict]]]
+) -> None:
+
     if os.path.exists(outfile):
-        print(f"overwriting file {outfile}... 🥛")
+        print(f"{timestr()} overwriting file {outfile}... 🥛")
     with bz2.open(outfile, "wt", newline="") as output_file:
         writer = csv.DictWriter(
             output_file,
@@ -823,155 +353,23 @@ def write_to_csv(outfile: str, revisions: Iterable[Dict]) -> None:
         )
         writer.writeheader()
         i = 0
-        for case in revisions:
+        for case in merge_iterators(
+            revision_iterator_functions,
+            chunk_size=config["concurrent_reads"],
+            buffer=config["backlog"],
+        ):
             writer.writerow(case)
             i += 1
             if i % 1000000 == 0 or i == 1:
                 print(f"{timestr()} wrote revision #{i}")
 
 
-class DatabaseAlreadyExists(Exception):
-    pass
+def write_to_database(
+    revision_iterator_functions: Iterable[Callable[..., Iterable[Dict]]]
+) -> None:
+    from write_to_database import write
 
-
-def write_to_database(executor: Executor, revisions: Iterable[Dict]) -> None:
-    from dateutil.parser import parse as parse_timestamp
-    from sqlalchemy import create_engine, Column, Integer, Text, DateTime
-    from sqlalchemy.orm import sessionmaker, scoped_session
-    from sqlalchemy_utils import database_exists, create_database, drop_database
-    from sqlalchemy.ext.declarative import declarative_base
-
-    SMALLBATCH = 50 * 1024 * 1024
-    BIGBATCH = 1024 * 1024 * 1024
-
-    Base = declarative_base()
-
-    class Revision(Base):
-        __tablename__ = "revisions"
-        id = Column(Integer, primary_key=True)
-        parent_id = Column(Integer)
-        timestamp = Column(DateTime, nullable=False)
-        text = Column(Text)
-        comment = Column(Text)
-        page_id = Column(Integer, nullable=False)
-        page_title = Column(Text, nullable=False)
-        page_ns = Column(Integer, nullable=False)
-        contributor_id = Column(Integer)
-        contributor_name = Column(Text)
-        contributor_ip = Column(Text)
-
-    def retype_revision(revision: Dict) -> Dict:
-        parent_id_str = revision["parent_id"]
-        contributor_id_str = revision["contributor_id"]
-        return {
-            **revision,
-            "id": int(revision["id"]),
-            "parent_id": int(parent_id_str) if parent_id_str is not None else None,
-            "timestamp": parse_timestamp(revision["timestamp"]),
-            "contributor_id": int(contributor_id_str) if contributor_id_str else None,
-        }
-
-    def retype_and_size_revision(raw_revision: Dict) -> Tuple[Dict, int]:
-        """
-        This function calls the revision retype function and estimates the size of
-        a revision in memory based on the size of its text and comment.
-        """
-        revision = retype_revision(raw_revision)
-        size = (
-            len((revision.get("text") or "").encode("utf-8"))
-            + len((revision.get("comment") or "").encode("utf-8"))
-            + 300  # estimate for the remaining small fields
-        )
-        # ^ sys.getsizeof doesn't work in pypy
-        return revision, size
-
-    def commit_batch(batch):
-        Session.bulk_insert_mappings(Revision, batch)
-        Session.commit()
-        Session.remove()
-
-    def multi_insert(batch):
-        Session.execute(Revision.__table__.insert(), batch)
-        Session.commit()
-        Session.remove()
-
-    retyped_and_sized_revisions = unordered_incremental_executor_map(
-        executor,
-        retype_and_size_revision,
-        revisions,
-        max_parallel=(os.cpu_count() or 4) * 2,
-        max_backlog=100 if config["low_memory"] else 2000,
-    )
-
-    print(f"{timestr()} structuring database... 📐")
-    engine = create_engine(
-        config["database_url"], pool_size=config["num_db_connections"]
-    )
-    if database_exists(engine.url):
-        if config["delete_database"]:
-            drop_database(engine.url)
-        else:
-            raise DatabaseAlreadyExists
-
-    try:
-        create_database(engine.url)
-        assert database_exists(engine.url)
-        Base.metadata.create_all(engine)
-        Session = scoped_session(sessionmaker(bind=engine))
-        print(f"{timestr()} adding revisions to session... 📖")
-
-        i = 0
-        batch_size = 0
-        max_batch_size = SMALLBATCH if config["low_memory"] else BIGBATCH
-        connection_limit = config["num_db_connections"]
-        active_commits = deque()
-        num_commits = 0
-        last_dispose = None
-        batch = []
-        for revision, revision_size in retyped_and_sized_revisions:
-            batch.append(revision)
-            batch_size += revision_size
-            if batch_size >= max_batch_size:
-                # add new commit task
-                if config["insert_multiple_values"]:
-                    commit_future = executor.submit(multi_insert, batch)
-                else:
-                    commit_future = executor.submit(commit_batch, batch)
-
-                active_commits.append(commit_future)
-                del commit_future
-
-                # label new commit task as previous commit task & increment
-                num_commits += 1
-                batch_size = 0
-                batch = []
-
-                # re-initialize engine to keep memory low
-                # see https://github.com/DominicBurkart/wikipedia-revisions/issues/15
-                if num_commits % (connection_limit * 2) == 0:
-                    if last_dispose is not None:
-                        last_dispose.result()
-                    last_dispose = executor.submit(engine.dispose)
-
-                # if at connection limit, sleep this thread until oldest commit is finished.
-                while len(active_commits) >= connection_limit:
-                    active_commits.popleft().result()
-
-            i += 1
-            if i % 1000000 == 0 or i == 1:
-                print(f"{timestr()} processed revision #{i}")
-        for commit in active_commits:
-            commit.result()
-        Session.remove()
-        print(
-            f"{timestr()} revisions written to database at: {config['database_url']} 🌈"
-        )
-    except Exception as e:
-        print(
-            f"{timestr()} exception while writing. deleting partial database & re-raising exception. 🌋"
-        )
-        drop_database(engine.url)
-        raise e
+    write(config, revision_iterator_functions)
 
 
 @click.command()
@@ -1058,9 +456,9 @@ def write_to_database(executor: Executor, revisions: Iterable[Dict]) -> None:
 @click.option(
     "--num-db-connections",
     "num_db_connections",
-    default=50,
+    default=20,
     type=int,
-    help="number of concurrent db connections allowed. Default 50. must be > 0.",
+    help="number of concurrent db connections allowed. Default is 15. must be > 0.",
 )
 def run(
     date,
@@ -1086,6 +484,7 @@ def run(
     config["concurrent_reads"] = concurrent_reads
     config["insert_multiple_values"] = insert_multiple_values
     config["num_db_connections"] = num_db_connections
+    config["backlog"] = 300 if low_memory else 5000
 
     if concurrent_reads < 1:
         raise ValueError("concurrent_reads must be at least 1.")
@@ -1096,41 +495,33 @@ def run(
     if config["low_storage"]:
         print(f"{timestr()} low storage mode active. 🐈 📦")
 
-    with ThreadPoolExecutor() as executor:
-        complete = False
-        while not complete:
-            try:
-                # download XML files from wikipedia and collect revisions
-                revisions = download_and_parse_files(executor)
+    complete = False
+    while not complete:
+        try:
+            # download XML files from wikipedia and collect revisions
+            revision_iterator_functions = download_and_parse_files()
 
-                # write collected revisions to output.
-                if use_database:
-                    write_to_database(executor, revisions)
-                else:
-                    write_to_csv(output_file, revisions)
-                print(f"{timestr()} program complete. 💐")
-                complete = True
-            except Exception as e:
-                if getattr(e, "errno", None) == errno.ENOSPC:
-                    print(f"{timestr()} no space left on device. Ending program. 😲")
-                    raise e
-                elif isinstance(e, DatabaseAlreadyExists):
-                    print(
-                        f"{timestr()} there is already a local version of the database. Doing nothing. HELP: to "
-                        f"overwrite database, use --delete-database flag. 🌅"
-                    )
-                    raise e
-                SLEEP_SECONDS = 5 * 60
-                print(traceback.format_exc())
-                print(
-                    f"{timestr()} caught exception ({e}). Sleeping {SLEEP_SECONDS/60} minutes..."
-                )
-                time.sleep(SLEEP_SECONDS)
-                print(f"{timestr()} Restarting...")
-            finally:
-                for fname in ["verified_files.txt", "canonical_hashes.txt"]:
-                    if os.path.exists(fname):
-                        os.remove(fname)
+            # write collected revisions to output.
+            if use_database:
+                write_to_database(revision_iterator_functions)
+            else:
+                write_to_csv(output_file, revision_iterator_functions)
+            print(f"{timestr()} program complete. 💐")
+            complete = True
+        except Exception as e:
+            if getattr(e, "errno", None) == errno.ENOSPC:
+                print(f"{timestr()} no space left on device. Ending program. 😲")
+                raise e
+            SLEEP_SECONDS = 5 * 60
+            print(
+                f"{timestr()} caught exception ({e}). Sleeping {SLEEP_SECONDS/60} minutes..."
+            )
+            time.sleep(SLEEP_SECONDS)
+            print(f"{timestr()} Restarting...")
+        finally:
+            for fname in ["verified_files.txt", "canonical_hashes.txt"]:
+                if os.path.exists(fname):
+                    os.remove(fname)
 
 
 if __name__ == "__main__":
