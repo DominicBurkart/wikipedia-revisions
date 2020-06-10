@@ -7,15 +7,28 @@ import xml.etree.ElementTree as ET
 import time
 import errno
 import traceback
-from concurrent.futures import ThreadPoolExecutor, Executor, Future
+import queue
+from concurrent.futures import (
+    ProcessPoolExecutor,
+    ThreadPoolExecutor,
+    Executor,
+    Future,
+    wait,
+    FIRST_COMPLETED,
+    ALL_COMPLETED,
+)
+import multiprocessing
 from functools import partial
 from typing import Optional, Callable, Dict, Generator, Iterable, Tuple, TypeVar, Any
 import hashlib
 import threading
 import platform
+from collections import deque
+from enum import Enum
 
 import requests
 import click
+import dill
 
 config = dict()
 
@@ -144,22 +157,11 @@ def extract_one_file(filename: str) -> Generator[Dict, None, None]:
         os.remove(filename)
 
 
-def make_extractors(
-    filenames_and_urls, append_bad_urls
-) -> Generator[Generator[Dict, None, None], None, None]:
-    for filename, url in filenames_and_urls:
-        if filename:
-            yield extract_one_file(filename)
-        else:
-            append_bad_urls.append(url)
-            # ^ if there is no filename, add url to the retry pile
-
-
-def parse_downloads(
+def verify_files(
     download_file_and_url: Iterable[Tuple[str, str]],
     append_bad_urls,
     executor: Executor,
-) -> Generator[Dict, None, None]:
+) -> Generator[str, None, None]:
     verified_files = VerifiedFilesRecord()
 
     # perform checksum
@@ -177,18 +179,20 @@ def parse_downloads(
             ),
         )
     else:
-        filenames_and_urls = incremental_executor_map(
+        filenames_and_urls = unordered_incremental_executor_map(
             executor,
             lambda tup: (check_hash(verified_files, tup[0]), tup[1]),
             download_file_and_url,
             max_parallel=os.cpu_count() or 4,
+            max_backlog=4 * (os.cpu_count() or 4),
         )
 
-    # extract files with valid checksums
-    file_extractors = make_extractors(filenames_and_urls, append_bad_urls)
-    chunk_size = config["concurrent_reads"]
-    for case in merge_generators(executor, file_extractors, chunk_size=chunk_size):
-        yield case
+    # yield filenames that passed checksum
+    for filename, url in filenames_and_urls:
+        if filename:
+            yield filename
+        else:
+            append_bad_urls.append(url)
 
 
 class VerifiedFilesRecord:
@@ -288,7 +292,7 @@ class _Waiter:
     def __init__(self):
         self.event = threading.Event()
         self.finished_futures = []
-        self.lock = threading.Lock()
+        self.lock = threading.RLock()
         self.n_pending: int = 0
 
     def add_result(self, future):
@@ -332,12 +336,11 @@ class Waiter:
             self.add(future)
 
     def add(self, future: Future):
-        with future._condition:
+        with self._waiter.lock:
             if future.done():
-                with self._waiter.lock:
-                    self.prior_completed.add(future)
+                self.prior_completed.add(future)
             else:
-                with self._waiter.lock:
+                with future._condition:
                     future._waiters.append(self._waiter)
                     self._waiter.n_pending += 1
 
@@ -351,10 +354,10 @@ class Waiter:
             while len(self.prior_completed) > 0:
                 yield self.prior_completed.pop().result()
             if not self.done():
-                self._waiter.event.wait()
+                self._waiter.event.wait(timeout=5)
                 finished_futures = self._waiter.collect_finished()
-                for future in finished_futures:
-                    yield process_future(future)
+                while len(finished_futures) > 0:
+                    yield process_future(finished_futures.pop())
 
         stragglers = self._waiter.collect_finished()
         for future in stragglers:
@@ -363,12 +366,14 @@ class Waiter:
     def done(self) -> bool:
         if self.completion_lock.locked():
             return False
-        with self._waiter.lock:
-            return self._waiter.n_pending == 0 and len(self.prior_completed) == 0
+        return self._waiter.n_pending == 0 and len(self.prior_completed) == 0
 
     def n_uncollected(self) -> int:
-        with self._waiter.lock:
-            return self._waiter.n_pending + len(self._waiter.finished_futures)
+        return (
+            self._waiter.n_pending
+            + len(self.prior_completed)
+            + len(self._waiter.finished_futures)
+        )
 
 
 def test_waiter():
@@ -379,74 +384,98 @@ def test_waiter():
             waiter.add(e.submit(lambda x: x, i))
         assert set(waiter.as_completed()) == set(range(20))
 
+    with ThreadPoolExecutor() as e:
+        futures = [e.submit(lambda x: x, i) for i in range(33)]
+        waiter = Waiter(futures)
+        for i in range(33, 66):
+            waiter.add(e.submit(lambda x: x, i))
+        assert set(waiter.as_completed()) == set(range(66))
+
 
 T = TypeVar("T")
 
 
-def merge_generators(
-    executor: Executor,
-    generators: Iterable[Generator[T, None, None]],
+class PoolExecutor(Enum):
+    Process = "Process"
+    Thread = "Thread"
+
+
+def merge_iterators(
+    iterator_functions: Iterable[Callable[..., Iterable[T]]],
     chunk_size: int = -1,
+    buffer: int = 10,
+    parallelization_strategy: PoolExecutor = PoolExecutor.Process,
 ) -> Generator[T, None, None]:
     """
-    Combines the output of multiple generators into a single generator. Since regular generators cannot
-    be polled concurrently, the number of concurrent tasks submitted by this function is at most the number
-    of generators.
+    Combines the output of multiple iterables into a single iterator. Since regular a iterator cannot
+    be polled from multiple threads concurrently, the number of concurrent tasks submitted by this function is at most
+    the number of iterator. Note: a separate thread is generated to poll the iterator functions and call them to
+    begin populating the output, regardless of the parallelization strategy. Results are returned eagerly. Order is
+    not guaranteed.
+
     :param executor: executor used to increment the generators.
-    :param generators: generators to combine results from.
+    :param iterator_functions: zero-arity functions that return iterators to combine results from.
     :param chunk_size: number of generators to poll from at once. If greater than the number of generators, ignored.
     if -1, ignored. If zero or a negative number other than -1, raises ValueError.
+    :param buffer: max number of backlogged values.
     :return: a generator over the combined outputs of all input generators.
     """
     if chunk_size < 1 and chunk_size != -1:
         raise ValueError("chunk_size must be greater than zero or equal to negative 1.")
+    if buffer < 1:
+        raise ValueError("buffer must be greater than 0.")
 
-    state = {"n_generators": 0, "n_exhausted": 0, "exhaustion_event": threading.Event()}
+    def _loader(
+        queue: multiprocessing.Queue,
+        iterators: Iterable[Iterable[T]],
+        chunk_size: int = -1,
+        executor_type: PoolExecutor = PoolExecutor.Process,
+    ):
+        def _iter_spanner(
+            serialized_iterator_function: bytes, queue: multiprocessing.Queue
+        ):
+            iterator_function = dill.loads(serialized_iterator_function)
+            for value in iterator_function():
+                queue.put(value)
 
-    def async_load_generators(
-        waiter: Waiter,
-        generators: Iterable[Generator[Any, None, None]],
-        acquired_lock: threading.Lock,
-    ) -> None:
-        for generator in generators:
-            future = executor.submit(
-                lambda generator: (next(generator, exhausted), generator), generator
-            )
-            waiter.add(future)
-            state["n_generators"] += 1
-            if chunk_size != -1 and (
-                chunk_size <= (state["n_generators"] - state["n_exhausted"])
-            ):
-                state["exhaustion_event"].wait()
-                state["exhaustion_event"].clear()
-        acquired_lock.release()
+        Executor = (
+            ProcessPoolExecutor
+            if executor_type == PoolExecutor.Process
+            else ThreadPoolExecutor
+        )
+        with Executor() as executor:
+            active_futures = set()
+            for iterator in iterators:
+                serialized_iterator = dill.dumps(iterator)
+                future = executor.submit(_iter_spanner, serialized_iterator, queue)
+                if chunk_size != -1:
+                    active_futures.add(future)
+                    while len(active_futures) >= chunk_size:
+                        complete_futures, active_futures = wait(
+                            active_futures, return_when=FIRST_COMPLETED
+                        )
+            if len(active_futures) > 0:
+                wait(active_futures, return_when=ALL_COMPLETED)
 
-    exhausted = Exhausted()
-    waiter = Waiter()
+    results_queue = multiprocessing.Manager().Queue(maxsize=buffer)
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        loader_future = executor.submit(
+            _loader,
+            results_queue,
+            iterator_functions,
+            chunk_size,
+            parallelization_strategy,
+        )
+        while not (loader_future.done() and results_queue.empty()):
+            try:
+                yield results_queue.get(timeout=0.1)
+            except queue.Empty:
+                pass
 
-    # asynchronously load generators
-    waiter.completion_lock.acquire()
-    async_load_future = executor.submit(
-        lambda tup: async_load_generators(*tup),
-        (waiter, iter(generators), waiter.completion_lock),
-    )
-
-    # yield values as they are completed & request next generator value
-    for (value, generator) in waiter.as_completed():
-        if value is not exhausted:
-            waiter.add(
-                executor.submit(lambda gen: (next(gen, exhausted), gen), generator)
-            )
-            yield value
-        else:
-            state["n_exhausted"] += 1
-            state["exhaustion_event"].set()
-            # ^ tell the loader it can add more generators if any are available.
-
-    assert async_load_future.done()
+        loader_future.result()  # rethrow any error that killed the loader
 
 
-def test_merge_generators():
+def test_merge_iterators():
     def gen1():
         for x in range(10):
             yield x
@@ -455,9 +484,15 @@ def test_merge_generators():
         for y in range(10, 20):
             yield y
 
-    with ThreadPoolExecutor() as e:
-        assert set(merge_generators(e, (gen1(), gen2()))) == set(range(20))
-        assert len(list(merge_generators(e, (gen1(), gen2())))) == 20
+    assert set(merge_iterators((gen1, gen2), 1, 1, PoolExecutor.Process)) == set(
+        range(20)
+    )
+    assert len(list(merge_iterators((gen1, gen2), 1, 1, PoolExecutor.Process))) == 20
+
+    assert set(merge_iterators([gen1, gen2], 1, 1, PoolExecutor.Thread)) == set(
+        range(20)
+    )
+    assert len(list(merge_iterators([gen1, gen2], 1, 1, PoolExecutor.Thread))) == 20
 
 
 class LazyList:
@@ -577,26 +612,32 @@ def peek_ahead(executor: Executor, iterable: Iterable[T]) -> Iterable[T]:
     """
     is_exhausted = False
     exhausted = Exhausted()
-    next_future = executor.submit(partial(next, iterable, exhausted))
+    iterator = iter(iterable)
+    next_future = executor.submit(partial(next, iterator, exhausted))
     while not is_exhausted:
         next_value = next_future.result()
         if next_value is exhausted:
             is_exhausted = True
         else:
-            next_future = executor.submit(partial(next, iterable, exhausted))
+            next_future = executor.submit(partial(next, iterator, exhausted))
             yield next_value
 
 
-def test_peek_ahead():
+def test_peek_ahead_iter():
     with ThreadPoolExecutor() as ex:
         assert list(range(10)) == list(peek_ahead(ex, iter(range(10))))
+
+
+def test_peek_ahead_range():
+    with ThreadPoolExecutor() as ex:
+        assert list(range(10)) == list(peek_ahead(ex, range(10)))
 
 
 FnInputType = TypeVar("FnInputType")
 FnOutputType = TypeVar("FnOutputType")
 
 
-def incremental_executor_map(
+def unordered_incremental_executor_map(
     executor: Executor,
     function: Callable[[FnInputType], FnOutputType],
     function_inputs: Iterable[FnInputType],
@@ -630,9 +671,8 @@ def incremental_executor_map(
     ):
         load_complete = False
         while not load_complete:
-            n_uncollected = waiter.n_uncollected()
-            while n_uncollected < max_parallel and (
-                (max_backlog == -1) or (n_uncollected < max_backlog)
+            while waiter._waiter.n_pending < max_parallel and (
+                (max_backlog == -1) or (waiter.n_uncollected() < max_backlog)
             ):
                 next_input = next(function_inputs, exhausted)
                 if next_input is not exhausted:
@@ -642,7 +682,7 @@ def incremental_executor_map(
                     load_complete = True
                     break
             if not load_complete:
-                waiter._waiter.event.wait(timeout=5)
+                waiter._waiter.event.wait(timeout=30)
         acquired_lock.release()
 
     waiter.completion_lock.acquire()
@@ -665,9 +705,9 @@ def incremental_executor_map(
     assert loader.done()
 
 
-def test_incremental_executor_map():
+def test_unordered_incremental_executor_map():
     with ThreadPoolExecutor() as ex:
-        out = incremental_executor_map(ex, lambda x: x, range(5))
+        out = unordered_incremental_executor_map(ex, lambda x: x, range(5))
         assert set(out) == set(range(5))
 
 
@@ -702,7 +742,9 @@ def full_dump_url_from_partial(partial: str):
         raise ValueError("dump page format has been updated.")
 
 
-def download_and_parse_files(executor: Executor,) -> Generator[Dict, None, None]:
+def download_and_parse_files(
+    executor: ThreadPoolExecutor
+) -> Generator[Dict, None, None]:
     # todo automatically find the last completed bz2 history job
     print(f"{timestr()} requesting dump directory... 📚")
     session = requests.Session()
@@ -732,38 +774,36 @@ def download_and_parse_files(executor: Executor,) -> Generator[Dict, None, None]
 
     # download & process the history files
     download_update_file_using_session = partial(download_update_file, session)
-    if config["low_storage"]:
-        print(f"{timestr()} low storage mode active. 🐈 📦")
-        file_and_url = peek_ahead(
-            executor,
-            map(
-                lambda update_url: (
-                    download_update_file_using_session(update_url),
-                    update_url,
-                ),
-                updates_urls,
-            ),
-        )
-    else:
-        file_and_url = incremental_executor_map(
-            executor,
-            lambda update_url: (
-                download_update_file_using_session(update_url),
-                update_url,
-            ),
-            updates_urls,
-            max_parallel=2,
-        )
+    file_and_url = unordered_incremental_executor_map(
+        executor,
+        lambda update_url: (download_update_file_using_session(update_url), update_url),
+        updates_urls,
+        max_parallel=2,
+        max_backlog=2 if config["low_storage"] else -1,
+    )
 
-    for revision in parse_downloads(
+    # verify files were correctly downloaded
+    verified_files = verify_files(
         file_and_url, append_bad_urls=updates_urls, executor=executor
+    )
+
+    # create functions that read and parse valid files
+    file_extractors = (
+        partial(extract_one_file, filename) for filename in verified_files
+    )
+
+    # dispatch file extraction functions for concurrent reading.
+    for case in merge_iterators(
+        file_extractors,
+        chunk_size=config["concurrent_reads"],
+        buffer=100 if config["low_memory"] else 2000,
     ):
-        yield revision
+        yield case
 
 
 def write_to_csv(outfile: str, revisions: Iterable[Dict]) -> None:
     if os.path.exists(outfile):
-        print(f"overwriting file {outfile}... 🤤")
+        print(f"overwriting file {outfile}... 🥛")
     with bz2.open(outfile, "wt", newline="") as output_file:
         writer = csv.DictWriter(
             output_file,
@@ -801,8 +841,8 @@ def write_to_database(executor: Executor, revisions: Iterable[Dict]) -> None:
     from sqlalchemy_utils import database_exists, create_database, drop_database
     from sqlalchemy.ext.declarative import declarative_base
 
-    SMALLBATCH = 1024
-    BIGBATCH = 5 * 1024
+    SMALLBATCH = 50 * 1024 * 1024
+    BIGBATCH = 1024 * 1024 * 1024
 
     Base = declarative_base()
 
@@ -831,6 +871,20 @@ def write_to_database(executor: Executor, revisions: Iterable[Dict]) -> None:
             "contributor_id": int(contributor_id_str) if contributor_id_str else None,
         }
 
+    def retype_and_size_revision(raw_revision: Dict) -> Tuple[Dict, int]:
+        """
+        This function calls the revision retype function and estimates the size of
+        a revision in memory based on the size of its text and comment.
+        """
+        revision = retype_revision(raw_revision)
+        size = (
+            len((revision.get("text") or "").encode("utf-8"))
+            + len((revision.get("comment") or "").encode("utf-8"))
+            + 300  # estimate for the remaining small fields
+        )
+        # ^ sys.getsizeof doesn't work in pypy
+        return revision, size
+
     def commit_batch(batch):
         Session.bulk_insert_mappings(Revision, batch)
         Session.commit()
@@ -841,16 +895,18 @@ def write_to_database(executor: Executor, revisions: Iterable[Dict]) -> None:
         Session.commit()
         Session.remove()
 
-    retyped_revisions = incremental_executor_map(
+    retyped_and_sized_revisions = unordered_incremental_executor_map(
         executor,
-        retype_revision,
+        retype_and_size_revision,
         revisions,
-        max_parallel=os.cpu_count(),
-        max_backlog=SMALLBATCH if config["low_memory"] else BIGBATCH,
+        max_parallel=(os.cpu_count() or 4) * 2,
+        max_backlog=100 if config["low_memory"] else 2000,
     )
 
     print(f"{timestr()} structuring database... 📐")
-    engine = create_engine(config["database_url"])
+    engine = create_engine(
+        config["database_url"], pool_size=config["num_db_connections"]
+    )
     if database_exists(engine.url):
         if config["delete_database"]:
             drop_database(engine.url)
@@ -863,28 +919,49 @@ def write_to_database(executor: Executor, revisions: Iterable[Dict]) -> None:
         Base.metadata.create_all(engine)
         Session = scoped_session(sessionmaker(bind=engine))
         print(f"{timestr()} adding revisions to session... 📖")
+
         i = 0
+        batch_size = 0
         max_batch_size = SMALLBATCH if config["low_memory"] else BIGBATCH
-        last_commit = None
+        connection_limit = config["num_db_connections"]
+        active_commits = deque()
+        num_commits = 0
+        last_dispose = None
         batch = []
-        for revision in retyped_revisions:
+        for revision, revision_size in retyped_and_sized_revisions:
             batch.append(revision)
-            if len(batch) >= max_batch_size:
+            batch_size += revision_size
+            if batch_size >= max_batch_size:
+                # add new commit task
                 if config["insert_multiple_values"]:
-                    next_commit = executor.submit(multi_insert, batch)
+                    commit_future = executor.submit(multi_insert, batch)
                 else:
-                    next_commit = executor.submit(commit_batch, batch)
-                if last_commit is not None:
-                    last_commit.result()
-                last_commit = next_commit
+                    commit_future = executor.submit(commit_batch, batch)
+
+                active_commits.append(commit_future)
+                del commit_future
+
+                # label new commit task as previous commit task & increment
+                num_commits += 1
+                batch_size = 0
                 batch = []
+
+                # re-initialize engine to keep memory low
+                # see https://github.com/DominicBurkart/wikipedia-revisions/issues/15
+                if num_commits % (connection_limit * 2) == 0:
+                    if last_dispose is not None:
+                        last_dispose.result()
+                    last_dispose = executor.submit(engine.dispose)
+
+                # if at connection limit, sleep this thread until oldest commit is finished.
+                while len(active_commits) >= connection_limit:
+                    active_commits.popleft().result()
+
             i += 1
-            if i % max_batch_size * 2 == 0:
-                engine.dispose()
             if i % 1000000 == 0 or i == 1:
                 print(f"{timestr()} processed revision #{i}")
-        if last_commit is not None:
-            last_commit.result()
+        for commit in active_commits:
+            commit.result()
         Session.remove()
         print(
             f"{timestr()} revisions written to database at: {config['database_url']} 🌈"
@@ -978,6 +1055,13 @@ def write_to_database(executor: Executor, revisions: Iterable[Dict]) -> None:
     "SQLAlchemy-covered databases. For more information on multi-value inserts in SQLAlchemy, see: "
     "http://docs.sqlalchemy.org/en/latest/core/dml.html#sqlalchemy.sql.expression.Insert.values.params.*args",
 )
+@click.option(
+    "--num-db-connections",
+    "num_db_connections",
+    default=50,
+    type=int,
+    help="number of concurrent db connections allowed. Default 50. must be > 0.",
+)
 def run(
     date,
     low_storage,
@@ -988,6 +1072,7 @@ def run(
     delete_database,
     concurrent_reads,
     insert_multiple_values,
+    num_db_connections,
 ):
     config["date"] = date
     config["dump_page_url"] = f"https://dumps.wikimedia.org/enwiki/{date}/"
@@ -1000,11 +1085,16 @@ def run(
     config["delete_database"] = delete_database
     config["concurrent_reads"] = concurrent_reads
     config["insert_multiple_values"] = insert_multiple_values
+    config["num_db_connections"] = num_db_connections
 
     if concurrent_reads < 1:
         raise ValueError("concurrent_reads must be at least 1.")
+    if num_db_connections < 1:
+        raise ValueError("num_db_connections must be at least 1.")
 
     print(f"{timestr()} program started. 👋")
+    if config["low_storage"]:
+        print(f"{timestr()} low storage mode active. 🐈 📦")
 
     with ThreadPoolExecutor() as executor:
         complete = False
