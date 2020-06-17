@@ -437,11 +437,11 @@ def write_to_database(
     "the wikipedia revisions data.",
 )
 @click.option(
-    "--concurrent-reads",
+    "--num-subprocesses",
     "concurrent_reads",
     default=2,
     type=int,
-    help="number of concurrently processed .xml.bz2 files. Default is 2. When using storage media "
+    help="number of concurrent processes, each reading one .xml.bz2 file. Default is 2. When using storage media "
     "with fast concurrent reads and high throughput (SSDs), higher values (e.g. the number of "
     "cpu cores) are better.",
 )
@@ -454,11 +454,11 @@ def write_to_database(
     "http://docs.sqlalchemy.org/en/latest/core/dml.html#sqlalchemy.sql.expression.Insert.values.params.*args",
 )
 @click.option(
-    "--num-db-connections",
+    "--db-connections-per-process",
     "num_db_connections",
-    default=20,
+    default=4,
     type=int,
-    help="number of concurrent db connections allowed. Default is 15. must be > 0.",
+    help="number of DB connections per process. Default is 4. Must be > 0.",
 )
 def run(
     date,

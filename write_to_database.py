@@ -1,5 +1,4 @@
 from typing import Dict, Tuple, Iterable, Callable
-from collections import deque
 from concurrent.futures import (
     ProcessPoolExecutor,
     ThreadPoolExecutor,
@@ -105,9 +104,6 @@ def _run_one_extractor(extractor, config):
     n_revisions_processed = 0
     batch_size = 0
     max_batch_size = SMALLBATCH if config["low_memory"] else BIGBATCH
-    connection_limit = int(
-        config["num_db_connections"] / config["concurrent_reads"]
-    )  # could be made more correct
     active_commits = set()
     num_commits = 0
     last_dispose = None
@@ -133,13 +129,13 @@ def _run_one_extractor(extractor, config):
 
                 # re-initialize engine to keep memory low
                 # see https://github.com/DominicBurkart/wikipedia-revisions/issues/15
-                if num_commits % (connection_limit * 2) == 0:
+                if num_commits % (config["num_db_connections"] * 2) == 0:
                     if last_dispose is not None:
                         last_dispose.result()
                     last_dispose = executor.submit(engine.dispose)
 
                 # if at connection limit, sleep this thread until at least one is finished.
-                while len(active_commits) >= connection_limit:
+                while len(active_commits) >= config["num_db_connections"]:
                     completed, active_commits = wait(
                         active_commits, return_when=FIRST_COMPLETED, timeout=30
                     )
@@ -147,7 +143,7 @@ def _run_one_extractor(extractor, config):
                         future.result()
             n_revisions_processed += 1
 
-        while len(active_commits) >= connection_limit:
+        while len(active_commits) >= config["num_db_connections"]:
             active_commits.pop().result()
         if config["insert_multiple_values"]:
             commit_future = executor.submit(_multi_insert, Session, batch)
