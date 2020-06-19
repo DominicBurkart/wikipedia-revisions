@@ -6,18 +6,25 @@ from concurrent.futures import (
     FIRST_COMPLETED,
 )
 import concurrent.futures
+import time
+import traceback
 
 from dateutil.parser import parse as parse_timestamp
 from sqlalchemy import create_engine, Column, Integer, Text, DateTime
 from sqlalchemy.orm import sessionmaker, scoped_session
 from sqlalchemy_utils import database_exists, create_database, drop_database
 from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.exc import SQLAlchemyError
 import dill
+
+from utils import timestr
 
 dill.settings["recurse"] = True
 
 SMALLBATCH = 50 * 1024 * 1024
 BIGBATCH = 500 * 1024 * 1024
+COMMIT_RETRIES = 6
+
 
 Base = declarative_base()
 
@@ -68,16 +75,40 @@ def _retype_and_size_revision(raw_revision: Dict) -> Tuple[Dict, int]:
     return revision, size
 
 
+def _commit_wrapper(fn: Callable[[], None], n_attempt: int = 1):
+    try:
+        fn()
+    except SQLAlchemyError as e:
+        if n_attempt < COMMIT_RETRIES:
+            sleep_seconds = n_attempt * 15
+            print(
+                f"{timestr()} error while committing. "
+                f"Sleeping {sleep_seconds} seconds and retrying (attempt #{n_attempt}). "
+                f"Error: {e} (printing stack trace below)"
+            )
+            traceback.print_exc()
+            time.sleep(sleep_seconds)
+            _commit_wrapper(fn, n_attempt + 1)
+        else:
+            raise e
+
+
 def _commit_batch(Session, batch):
-    Session.bulk_insert_mappings(Revision, batch)
-    Session.commit()
-    Session.remove()
+    def _commit():
+        Session.bulk_insert_mappings(Revision, batch)
+        Session.commit()
+        Session.remove()
+
+    _commit_wrapper(_commit)
 
 
 def _multi_insert(Session, batch):
-    Session.execute(Revision.__table__.insert(), batch)
-    Session.commit()
-    Session.remove()
+    def _commit():
+        Session.execute(Revision.__table__.insert(), batch)
+        Session.commit()
+        Session.remove()
+
+    _commit_wrapper(_commit)
 
 
 def _run_dilled_function(dilled_extractor_function: bytes):
@@ -157,7 +188,6 @@ def _run_one_extractor(extractor, config):
 def write(
     config: Dict, revision_iterator_functions: Iterable[Callable[..., Iterable[Dict]]]
 ) -> None:
-    from utils import timestr
 
     print(f"{timestr()} structuring database... 📐")
     engine = create_engine(
