@@ -72,27 +72,27 @@ pypy3 -m pip install -r database_requirements.txt
 
 Use `--help` to see the available options:
 ```sh
-python3 wikipedia_download.py --help
+python3 wikipedia_revisions/download.py --help
 ```
 
 Output all revisions into a giant bz2-zipped csv:
 ```sh 
-python3 wikipedia_download.py
+python3 wikipedia_revisions/download.py
 ```
 
 Use a wikipedia dump from a specific date:
 ```sh
-python3 wikipedia_download.py --date 20200101
+python3 wikipedia_revisions/download.py --date 20200101
 ```
 
 Output to postgres database named "wikipedia_revisions" waiting at localhost port 5432:
 ```sh
-python3 wikipedia_download.py --database
+python3 wikipedia_revisions/download.py --database
 ```
 
 To set the database url:
 ```sh
-python3 wikipedia_download.py --database --database-url postgres://postgres@localhost:5432/wikipedia_revisions
+python3 wikipedia_revisions/download.py --database --database-url postgres://postgres@localhost:5432/wikipedia_revisions
 ```
 
 Note: PyPy is only supported for outputting to a CSV file or to a 
@@ -102,12 +102,12 @@ custom database url must point to a postgres database and start with
 `postgresql+psycopg2cffi:///wikipedia_revisions`.
 
 ## Configuration Notes
-The above information is sufficient for you to run the program. The information below is useful for optimization.
+The above information is sufficient for you to run the program. The information below is useful for tuning performance.
 
 - if you're using an SSD, set `--num-subprocesses` to a higher number (e.g. the number of CPU cores).
 - this program is I/O heavy and relies on the OS's [page cache](https://en.wikipedia.org/wiki/Page_cache). Having a few gigabytes of free memory for the cache to use will improve I/O throughput.
 - using an SSD provides substantial benefits for this program, by increasing I/O speed and eliminating needle-moving cost.
 - if writing to a database stored on an external drive, run the program in a directory on a different drive than the database (and ideally the OS). The wikidump is downloaded into the current directory, so putting them on a different disk than the output database avoids throughput and needle-moving issues. As an example configuration, here is the command that I used to process the revisions into a local postgres database using two external drives (an SSD, and a larger HDD that holds the output database). The `nohup` command prevents the command from stopping if the terminal process that spawned it is closed, and the output is saved in nohup.out. The tail program outputs the contents of nohup.out to the screen for monitoring. The flags are optimized for writing to a postgres database (which supports multi-value inserts) and take advantage of SSD's fast non-sequential reads using concurrent-reads. 
 ```sh
-cd /path/to/ssd/without/db && nohup time pypy3 -u /path/to/wikipedia_download.py --date 20200401 --database --delete-database --num-subprocesses 4 --db-connections-per-process 2 --insert-multiple-values --large-memory & tail -f nohup.out 
+cd /path/to/ssd/without/db && nohup time pypy3 -u /path/to/download.py --date 20200401 --database --delete-database --num-subprocesses 4 --db-connections-per-process 2 --insert-multiple-values --large-memory & tail -f nohup.out 
 ```

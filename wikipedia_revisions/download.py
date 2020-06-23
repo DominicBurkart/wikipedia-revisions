@@ -1,19 +1,18 @@
 import bz2
 import csv
-import re
-import xml.etree.ElementTree as ET
-import time
 import errno
-from typing import Optional, Dict, Generator, Iterable, Tuple, Callable
-from concurrent.futures import ThreadPoolExecutor
 import hashlib
-import platform
 import os
+import platform
+import re
 import threading
+import time
+import xml.etree.ElementTree as ET
+from concurrent.futures import ThreadPoolExecutor
+from typing import Optional, Dict, Generator, Iterable, Tuple, Callable
 
-import requests
 import click
-
+import requests
 from utils import (
     timestr,
     peek_ahead,

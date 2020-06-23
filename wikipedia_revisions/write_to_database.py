@@ -1,21 +1,21 @@
-from typing import Dict, Tuple, Iterable, Callable
+import concurrent.futures
+import time
+import traceback
 from concurrent.futures import (
     ProcessPoolExecutor,
     ThreadPoolExecutor,
     wait,
     FIRST_COMPLETED,
 )
-import concurrent.futures
-import time
-import traceback
+from typing import Dict, Tuple, Iterable, Callable
 
+import dill
 from dateutil.parser import parse as parse_timestamp
 from sqlalchemy import create_engine, Column, Integer, Text, DateTime
+from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, scoped_session
 from sqlalchemy_utils import database_exists, create_database, drop_database
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.exc import SQLAlchemyError
-import dill
 
 from utils import timestr
 
