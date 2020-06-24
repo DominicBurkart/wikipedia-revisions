@@ -13,7 +13,7 @@ from typing import Optional, Dict, Generator, Iterable, Tuple, Callable
 
 import click
 import requests
-from utils import (
+from wikipedia_revisions.utils import (
     timestr,
     peek_ahead,
     unordered_incremental_executor_map,
@@ -366,7 +366,7 @@ def write_to_csv(
 def write_to_database(
     revision_iterator_functions: Iterable[Callable[..., Iterable[Dict]]]
 ) -> None:
-    from write_to_database import write
+    from wikipedia_revisions.write_to_database import write
 
     write(config, revision_iterator_functions)
 

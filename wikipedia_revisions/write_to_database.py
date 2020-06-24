@@ -17,7 +17,7 @@ from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, scoped_session
 from sqlalchemy_utils import database_exists, create_database, drop_database
 
-from utils import timestr
+from wikipedia_revisions.utils import timestr
 
 dill.settings["recurse"] = True
 
