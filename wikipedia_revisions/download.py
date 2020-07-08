@@ -9,7 +9,7 @@ import threading
 import time
 import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor
-from typing import Optional, Dict, Generator, Iterable, Tuple, Callable
+from typing import Optional, Dict, Generator, Iterable, Tuple, Callable, TextIO
 
 import click
 import requests
@@ -279,7 +279,7 @@ def full_dump_url_from_partial(partial: str):
         raise ValueError("dump page format has been updated.")
 
 
-def download_and_parse_files() -> Generator[Dict, None, None]:
+def download_and_parse_files() -> Iterable[Callable[..., Generator[Dict, None, None]]]:
     # todo automatically find the last completed bz2 history job
     print(f"{timestr()} requesting dump directory... 📚")
     session = requests.Session()
@@ -328,39 +328,36 @@ def download_and_parse_files() -> Generator[Dict, None, None]:
 
 
 def write_to_csv(
-    outfile: str, revision_iterator_functions: Iterable[Callable[..., Iterable[Dict]]]
+    output_file: TextIO,
+    revision_iterator_functions: Iterable[Callable[..., Iterable[Dict]]],
 ) -> None:
-
-    if os.path.exists(outfile):
-        print(f"{timestr()} overwriting file {outfile}... 🥛")
-    with bz2.open(outfile, "wt", newline="") as output_file:
-        writer = csv.DictWriter(
-            output_file,
-            [
-                "id",
-                "parent_id",
-                "page_title",
-                "contributor_id",
-                "contributor_name",
-                "contributor_ip",
-                "timestamp",
-                "text",
-                "comment",
-                "page_id",
-                "page_ns",
-            ],
-        )
-        writer.writeheader()
-        i = 0
-        for case in merge_iterators(
-            revision_iterator_functions,
-            chunk_size=config["concurrent_reads"],
-            buffer=config["backlog"],
-        ):
-            writer.writerow(case)
-            i += 1
-            if i % 1000000 == 0 or i == 1:
-                print(f"{timestr()} wrote revision #{i}")
+    writer = csv.DictWriter(
+        output_file,
+        [
+            "id",
+            "parent_id",
+            "page_title",
+            "contributor_id",
+            "contributor_name",
+            "contributor_ip",
+            "timestamp",
+            "text",
+            "comment",
+            "page_id",
+            "page_ns",
+        ],
+    )
+    writer.writeheader()
+    i = 0
+    for case in merge_iterators(
+        revision_iterator_functions,
+        chunk_size=config["concurrent_reads"],
+        buffer=config["backlog"],
+    ):
+        writer.writerow(case)
+        i += 1
+        if i % 1000000 == 0 or i == 1:
+            print(f"{timestr()} wrote revision #{i}")
 
 
 def write_to_database(
@@ -459,6 +456,13 @@ def write_to_database(
     type=int,
     help="number of DB connections per process. Default is 4. Must be > 0.",
 )
+@click.option(
+    "-p",
+    "--pipe",
+    "pipe",
+    default=None,
+    help="write revisions as an uncompressed csv to the passed named pipe.",
+)
 def run(
     date,
     low_storage,
@@ -470,6 +474,7 @@ def run(
     concurrent_reads,
     insert_multiple_values,
     num_db_connections,
+    pipe,
 ):
     config["date"] = date
     config["dump_page_url"] = f"https://dumps.wikimedia.org/enwiki/{date}/"
@@ -484,6 +489,7 @@ def run(
     config["insert_multiple_values"] = insert_multiple_values
     config["num_db_connections"] = num_db_connections
     config["backlog"] = 300 if low_memory else 5000
+    config["pipe"] = pipe
 
     if concurrent_reads < 1:
         raise ValueError("concurrent_reads must be at least 1.")
@@ -501,10 +507,16 @@ def run(
             revision_iterator_functions = download_and_parse_files()
 
             # write collected revisions to output.
-            if use_database:
+            if pipe is not None:
+                with open(pipe, "w") as out:
+                    write_to_csv(out, revision_iterator_functions)
+            elif use_database:
                 write_to_database(revision_iterator_functions)
             else:
-                write_to_csv(output_file, revision_iterator_functions)
+                if os.path.exists(output_file):
+                    print(f"{timestr()} overwriting file {output_file}... 🥛")
+                with bz2.open(output_file, "wt", newline="") as out:
+                    write_to_csv(out, revision_iterator_functions)
             print(f"{timestr()} program complete. 💐")
             complete = True
         except Exception as e:
