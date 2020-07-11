@@ -8,8 +8,15 @@ import re
 import threading
 import time
 import xml.etree.ElementTree as ET
-from concurrent.futures import ThreadPoolExecutor
-from typing import Optional, Dict, Generator, Iterable, Tuple, Callable, TextIO
+from concurrent.futures import (
+    ThreadPoolExecutor,
+    ProcessPoolExecutor,
+    wait,
+    FIRST_COMPLETED,
+)
+from typing import Optional, Dict, Generator, Iterable, Tuple, Callable
+import fcntl
+
 
 import click
 import requests
@@ -18,11 +25,24 @@ from wikipedia_revisions.utils import (
     timestr,
     peek_ahead,
     unordered_incremental_executor_map,
-    merge_iterators,
     LazyList,
 )
 
 config = dict()
+
+FIELDS = [
+    "id",
+    "parent_id",
+    "page_title",
+    "contributor_id",
+    "contributor_name",
+    "contributor_ip",
+    "timestamp",
+    "text",
+    "comment",
+    "page_id",
+    "page_ns",
+]
 
 
 def download_update_file(session: requests.Session, url: str) -> str:
@@ -328,42 +348,72 @@ def download_and_parse_files() -> Iterable[Callable[..., Generator[Dict, None, N
             yield lambda: parse_one_file(filename)
 
 
+def _write_rows_to_file(revision_maker, filename, to_pipe, fields):
+    def _write(out):
+        i = 0
+        writer = csv.DictWriter(out, fields)
+        for revision in revision_maker():
+            fcntl.flock(out, fcntl.LOCK_EX)
+            writer.writerow(revision)
+            out.flush()
+            fcntl.flock(out, fcntl.LOCK_UN)
+            i += 1
+        return i
+
+    if to_pipe:
+        with open(filename, "w") as out:
+            return _write(out)
+    else:
+        with bz2.open(filename, "at", newline="") as out:
+            return _write(out)
+
+
 def write_to_csv(
-    output_file: TextIO,
+    output_filename: str,
     revision_iterator_functions: Iterable[Callable[..., Iterable[Dict]]],
-    should_flush: bool = False,
+    to_pipe: bool = False,
 ) -> None:
-    writer = csv.DictWriter(
-        output_file,
-        [
-            "id",
-            "parent_id",
-            "page_title",
-            "contributor_id",
-            "contributor_name",
-            "contributor_ip",
-            "timestamp",
-            "text",
-            "comment",
-            "page_id",
-            "page_ns",
-        ],
-    )
-    writer.writeheader()
-    if should_flush:
-        output_file.flush()
-    i = 0
-    for case in merge_iterators(
-        revision_iterator_functions,
-        chunk_size=config["concurrent_reads"],
-        buffer=config["backlog"],
-    ):
-        writer.writerow(case)
-        if should_flush:
-            output_file.flush()
-        i += 1
-        if i % 1000000 == 0 or i == 1:
-            print(f"{timestr()} wrote revision #{i}")
+    def _write():
+        i = 0
+        active_readers = set()
+        with ProcessPoolExecutor(max_workers=config["concurrent_reads"]) as executor:
+            for revision_maker in revision_iterator_functions:
+                while len(active_readers) >= config["concurrent_reads"]:
+                    completed_readers, active_readers = wait(
+                        active_readers, return_when=FIRST_COMPLETED, timeout=60
+                    )
+                    for future in completed_readers:
+                        i += future.result()
+                        print(f"{timestr()} wrote revision #{i}")
+                active_readers.add(
+                    executor.submit(
+                        _write_rows_to_file,
+                        revision_maker,
+                        output_filename,
+                        to_pipe,
+                        FIELDS,
+                    )
+                )
+            while len(active_readers) > 0:
+                completed_readers, active_readers = wait(
+                    active_readers, return_when=FIRST_COMPLETED, timeout=120
+                )
+                for future in completed_readers:
+                    i += future.result()
+                    print(f"{timestr()} wrote revision #{i}")
+
+    if to_pipe:
+        with open(output_filename, "w") as out:
+            writer = csv.DictWriter(out, FIELDS)
+            writer.writeheader()
+            out.flush()
+            _write()
+    else:
+        with bz2.open(output_filename, "wt", newline="") as out:
+            writer = csv.DictWriter(out, FIELDS)
+            writer.writeheader()
+            out.flush()
+            _write()
 
 
 def write_to_database(
@@ -516,17 +566,15 @@ def run(
             if pipe is not None:
                 if not os.path.exists(pipe):
                     raise FileNotFoundError(
-                        f"named pipe not found at: {pipe}\nhint: initialize pipe with mkfifo"
+                        f"named pipe not found at: {pipe}\nhint: initialize pipe with mkfifo  🕳️"
                     )
-                with open(pipe, "w") as out:
-                    write_to_csv(out, revision_iterator_functions, True)
+                write_to_csv(pipe, revision_iterator_functions, True)
             elif use_database:
                 write_to_database(revision_iterator_functions)
             else:
                 if os.path.exists(output_file):
                     print(f"{timestr()} overwriting file {output_file}... 🥛")
-                with bz2.open(output_file, "wt", newline="") as out:
-                    write_to_csv(out, revision_iterator_functions)
+                write_to_csv(output_file, revision_iterator_functions)
             print(f"{timestr()} program complete. 💐")
             complete = True
         except Exception as e:

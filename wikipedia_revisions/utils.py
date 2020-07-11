@@ -1,6 +1,5 @@
 from typing import Tuple, Iterable, Callable, Generator, TypeVar, Any
 import threading
-import queue
 import multiprocessing
 from concurrent.futures import (
     Executor,
@@ -178,73 +177,6 @@ def _loader(
         )
         for future in completed_futures:
             future.result()
-
-
-def merge_iterators(
-    iterator_functions: Iterable[Callable[..., Iterable[T]]],
-    chunk_size: int = -1,
-    buffer: int = 10,
-    parallelization_strategy: PoolExecutor = PoolExecutor.Thread,
-) -> Generator[T, None, None]:
-    """
-    Combines the output of multiple iterables into a single iterator. Since regular a iterator cannot
-    be polled from multiple threads concurrently, the number of concurrent tasks submitted by this function is at most
-    the number of iterators. Note: a separate thread is generated to poll the iterator functions and call them to
-    begin populating the output, regardless of the parallelization strategy. Results are returned eagerly. Order is
-    not guaranteed.
-
-    :param executor: executor used to increment the generators.
-    :param iterator_functions: zero-arity functions that return iterators to combine results from.
-    :param chunk_size: number of generators to poll from at once. If greater than the number of generators, ignored.
-    if -1, max concurrency is set by the underlying PoolExecutor (ProcessPoolExecutor or ThreadPoolExecutor from
-    concurrent.futures).
-    :param buffer: max number of backlogged values.
-    :param parallelization_strategy: kind of PoolExecutor to use.
-    :return: a generator over the combined outputs of all input generators.
-    """
-    if chunk_size < 1 and chunk_size != -1:
-        raise ValueError("chunk_size must be greater than zero or equal to negative 1.")
-    if buffer < 1:
-        raise ValueError("buffer must be greater than 0.")
-
-    if parallelization_strategy != PoolExecutor.Thread:
-        raise NotImplementedError(
-            "currently, only thread-based parallelization is available. "
-            "See https://github.com/DominicBurkart/wikipedia-revisions/pull/19"
-        )
-
-    results_queue = multiprocessing.Manager().Queue(maxsize=buffer)
-    with ThreadPoolExecutor(max_workers=chunk_size + 1) as executor:
-        loader_future = executor.submit(
-            _loader, executor, results_queue, iterator_functions, chunk_size
-        )
-        future_done = False
-        is_empty = False
-        while not (future_done and is_empty):
-            try:
-                yield results_queue.get(timeout=0.1)
-            except queue.Empty:
-                if future_done and results_queue.empty():
-                    is_empty = True
-                else:
-                    future_done = loader_future.done()
-
-        loader_future.result()  # rethrow any error that killed the loader
-
-
-def test_merge_iterators():
-    def gen1():
-        for x in range(1000):
-            yield x
-
-    def gen2():
-        for y in range(1000, 2000):
-            yield y
-
-    assert set(merge_iterators([gen1, gen2], 1, 1, PoolExecutor.Thread)) == set(
-        range(2000)
-    )
-    assert len(list(merge_iterators([gen1, gen2], 1, 1, PoolExecutor.Thread))) == 2000
 
 
 class LazyList:
