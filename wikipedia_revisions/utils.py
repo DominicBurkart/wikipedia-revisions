@@ -4,7 +4,6 @@ import queue
 import multiprocessing
 from concurrent.futures import (
     Executor,
-    ProcessPoolExecutor,
     ThreadPoolExecutor,
     Future,
     wait,
@@ -147,11 +146,45 @@ def _iter_spanner(serialized_iterator_function: bytes, queue: multiprocessing.Qu
         queue.put(value)
 
 
+def _loader(
+    executor: ThreadPoolExecutor,
+    queue: multiprocessing.Queue,
+    iterator_functions: Iterable[Iterable[T]],
+    chunk_size: int = -1,
+):
+    executor_kwargs = {}
+    if chunk_size != -1:
+        executor_kwargs["max_workers"] = chunk_size
+
+    active_futures = set()
+    for iterator_function in iterator_functions:
+        serialized_iterator = dill.dumps(iterator_function)
+        future = executor.submit(_iter_spanner, serialized_iterator, queue)
+        if chunk_size != -1:
+            active_futures.add(future)
+            while len(active_futures) >= chunk_size:
+                completed_futures, active_futures = wait(
+                    active_futures,
+                    return_when=FIRST_COMPLETED,
+                    timeout=(0.1 * len(active_futures)) + 10,
+                )
+                for future in completed_futures:
+                    future.result()
+    while len(active_futures) > 0:
+        completed_futures, active_futures = wait(
+            active_futures,
+            return_when=ALL_COMPLETED,
+            timeout=(0.1 * len(active_futures)) + 45,
+        )
+        for future in completed_futures:
+            future.result()
+
+
 def merge_iterators(
     iterator_functions: Iterable[Callable[..., Iterable[T]]],
     chunk_size: int = -1,
     buffer: int = 10,
-    parallelization_strategy: PoolExecutor = PoolExecutor.Process,
+    parallelization_strategy: PoolExecutor = PoolExecutor.Thread,
 ) -> Generator[T, None, None]:
     """
     Combines the output of multiple iterables into a single iterator. Since regular a iterator cannot
@@ -174,53 +207,16 @@ def merge_iterators(
     if buffer < 1:
         raise ValueError("buffer must be greater than 0.")
 
-    def _loader(
-        queue: multiprocessing.Queue,
-        iterator_functions: Iterable[Iterable[T]],
-        chunk_size: int = -1,
-        executor_type: PoolExecutor = PoolExecutor.Process,
-    ):
-        Executor = (
-            ProcessPoolExecutor
-            if executor_type == PoolExecutor.Process
-            else ThreadPoolExecutor
+    if parallelization_strategy != PoolExecutor.Thread:
+        raise NotImplementedError(
+            "currently, only thread-based parallelization is available. "
+            "See https://github.com/DominicBurkart/wikipedia-revisions/pull/19"
         )
-        executor_kwargs = {}
-        if chunk_size != -1:
-            executor_kwargs["max_workers"] = chunk_size
-
-        with Executor(**executor_kwargs) as executor:
-            active_futures = set()
-            for iterator_function in iterator_functions:
-                serialized_iterator = dill.dumps(iterator_function)
-                future = executor.submit(_iter_spanner, serialized_iterator, queue)
-                if chunk_size != -1:
-                    active_futures.add(future)
-                    while len(active_futures) >= chunk_size:
-                        completed_futures, active_futures = wait(
-                            active_futures,
-                            return_when=FIRST_COMPLETED,
-                            timeout=(0.1 * len(active_futures)) + 10,
-                        )
-                        for future in completed_futures:
-                            future.result()
-            while len(active_futures) > 0:
-                completed_futures, active_futures = wait(
-                    active_futures,
-                    return_when=ALL_COMPLETED,
-                    timeout=(0.1 * len(active_futures)) + 45,
-                )
-                for future in completed_futures:
-                    future.result()
 
     results_queue = multiprocessing.Manager().Queue(maxsize=buffer)
-    with ThreadPoolExecutor(max_workers=1) as executor:
+    with ThreadPoolExecutor(max_workers=chunk_size + 1) as executor:
         loader_future = executor.submit(
-            _loader,
-            results_queue,
-            iterator_functions,
-            chunk_size,
-            parallelization_strategy,
+            _loader, executor, results_queue, iterator_functions, chunk_size
         )
         future_done = False
         is_empty = False
@@ -244,11 +240,6 @@ def test_merge_iterators():
     def gen2():
         for y in range(1000, 2000):
             yield y
-
-    assert set(merge_iterators((gen1, gen2), 1, 1, PoolExecutor.Process)) == set(
-        range(2000)
-    )
-    assert len(list(merge_iterators((gen1, gen2), 1, 1, PoolExecutor.Process))) == 2000
 
     assert set(merge_iterators([gen1, gen2], 1, 1, PoolExecutor.Thread)) == set(
         range(2000)
