@@ -2,11 +2,17 @@ from typing import Tuple, Iterable, Callable, Generator, TypeVar, Any
 import threading
 import queue
 import multiprocessing
-from concurrent.futures import Executor, ProcessPoolExecutor, ThreadPoolExecutor, Future
+from concurrent.futures import (
+    Executor,
+    ThreadPoolExecutor,
+    Future,
+    wait,
+    FIRST_COMPLETED,
+    ALL_COMPLETED,
+)
 from enum import Enum
 import datetime
 from functools import partial
-from collections import deque
 import os
 
 import dill
@@ -140,11 +146,45 @@ def _iter_spanner(serialized_iterator_function: bytes, queue: multiprocessing.Qu
         queue.put(value)
 
 
+def _loader(
+    executor: ThreadPoolExecutor,
+    queue: multiprocessing.Queue,
+    iterator_functions: Iterable[Iterable[T]],
+    chunk_size: int = -1,
+):
+    executor_kwargs = {}
+    if chunk_size != -1:
+        executor_kwargs["max_workers"] = chunk_size
+
+    active_futures = set()
+    for iterator_function in iterator_functions:
+        serialized_iterator = dill.dumps(iterator_function)
+        future = executor.submit(_iter_spanner, serialized_iterator, queue)
+        if chunk_size != -1:
+            active_futures.add(future)
+            while len(active_futures) >= chunk_size:
+                completed_futures, active_futures = wait(
+                    active_futures,
+                    return_when=FIRST_COMPLETED,
+                    timeout=(0.1 * len(active_futures)) + 10,
+                )
+                for future in completed_futures:
+                    future.result()
+    while len(active_futures) > 0:
+        completed_futures, active_futures = wait(
+            active_futures,
+            return_when=ALL_COMPLETED,
+            timeout=(0.1 * len(active_futures)) + 45,
+        )
+        for future in completed_futures:
+            future.result()
+
+
 def merge_iterators(
     iterator_functions: Iterable[Callable[..., Iterable[T]]],
     chunk_size: int = -1,
     buffer: int = 10,
-    parallelization_strategy: PoolExecutor = PoolExecutor.Process,
+    parallelization_strategy: PoolExecutor = PoolExecutor.Thread,
 ) -> Generator[T, None, None]:
     """
     Combines the output of multiple iterables into a single iterator. Since regular a iterator cannot
@@ -167,41 +207,16 @@ def merge_iterators(
     if buffer < 1:
         raise ValueError("buffer must be greater than 0.")
 
-    def _loader(
-        queue: multiprocessing.Queue,
-        iterator_functions: Iterable[Iterable[T]],
-        chunk_size: int = -1,
-        executor_type: PoolExecutor = PoolExecutor.Process,
-    ):
-        Executor = (
-            ProcessPoolExecutor
-            if executor_type == PoolExecutor.Process
-            else ThreadPoolExecutor
+    if parallelization_strategy != PoolExecutor.Thread:
+        raise NotImplementedError(
+            "currently, only thread-based parallelization is available. "
+            "See https://github.com/DominicBurkart/wikipedia-revisions/pull/19"
         )
-        executor_kwargs = {}
-        if chunk_size != -1:
-            executor_kwargs["max_workers"] = chunk_size
-
-        with Executor(**executor_kwargs) as executor:
-            active_futures = deque()
-            for iterator_function in iterator_functions:
-                serialized_iterator = dill.dumps(iterator_function)
-                future = executor.submit(_iter_spanner, serialized_iterator, queue)
-                if chunk_size != -1:
-                    active_futures.append(future)
-                    while len(active_futures) >= chunk_size:
-                        active_futures.popleft().result()
-            if len(active_futures) > 0:
-                active_futures.popleft().result()
 
     results_queue = multiprocessing.Manager().Queue(maxsize=buffer)
-    with ThreadPoolExecutor(max_workers=1) as executor:
+    with ThreadPoolExecutor(max_workers=chunk_size + 1) as executor:
         loader_future = executor.submit(
-            _loader,
-            results_queue,
-            iterator_functions,
-            chunk_size,
-            parallelization_strategy,
+            _loader, executor, results_queue, iterator_functions, chunk_size
         )
         future_done = False
         is_empty = False
@@ -219,22 +234,17 @@ def merge_iterators(
 
 def test_merge_iterators():
     def gen1():
-        for x in range(10):
+        for x in range(1000):
             yield x
 
     def gen2():
-        for y in range(10, 20):
+        for y in range(1000, 2000):
             yield y
 
-    assert set(merge_iterators((gen1, gen2), 1, 1, PoolExecutor.Process)) == set(
-        range(20)
-    )
-    assert len(list(merge_iterators((gen1, gen2), 1, 1, PoolExecutor.Process))) == 20
-
     assert set(merge_iterators([gen1, gen2], 1, 1, PoolExecutor.Thread)) == set(
-        range(20)
+        range(2000)
     )
-    assert len(list(merge_iterators([gen1, gen2], 1, 1, PoolExecutor.Thread))) == 20
+    assert len(list(merge_iterators([gen1, gen2], 1, 1, PoolExecutor.Thread))) == 2000
 
 
 class LazyList:
