@@ -14,8 +14,9 @@ from concurrent.futures import (
     wait,
     FIRST_COMPLETED,
 )
-from typing import Optional, Dict, Generator, Iterable, Tuple, Callable
+from typing import Optional, Dict, Generator, Iterable, Tuple, Callable, List
 import fcntl
+import math
 
 
 import click
@@ -348,15 +349,26 @@ def download_and_parse_files() -> Iterable[Callable[..., Generator[Dict, None, N
             yield lambda: parse_one_file(filename)
 
 
-def _write_rows_to_file(revision_maker, filename, to_pipe, fields):
+def _write_rows_to_file(
+    revision_maker: Callable[..., Iterable[Dict]],
+    filename: str,
+    to_pipe: bool,
+    fields: List[str],
+    process_buffer_length: int,
+):
     def _write(out):
         i = 0
         writer = csv.DictWriter(out, fields)
+        buffer = []
         for revision in revision_maker():
-            fcntl.flock(out, fcntl.LOCK_EX)
-            writer.writerow(revision)
-            out.flush()
-            fcntl.flock(out, fcntl.LOCK_UN)
+            buffer.append(revision)
+            if len(buffer) >= process_buffer_length:
+                fcntl.flock(out, fcntl.LOCK_EX)
+                for rev in buffer:
+                    writer.writerow(rev)
+                out.flush()
+                fcntl.flock(out, fcntl.LOCK_UN)
+                buffer = []
             i += 1
         return i
 
@@ -392,6 +404,7 @@ def write_to_csv(
                         output_filename,
                         to_pipe,
                         FIELDS,
+                        int(math.floor(config["backlog"] / config["concurrent_reads"])),
                     )
                 )
             while len(active_readers) > 0:
@@ -407,13 +420,13 @@ def write_to_csv(
             writer = csv.DictWriter(out, FIELDS)
             writer.writeheader()
             out.flush()
-            _write()
+            _write()  # don't close the pipe until all revisions have been written
     else:
         with bz2.open(output_filename, "wt", newline="") as out:
             writer = csv.DictWriter(out, FIELDS)
             writer.writeheader()
             out.flush()
-            _write()
+        _write()
 
 
 def write_to_database(
