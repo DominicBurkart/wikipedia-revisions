@@ -349,15 +349,30 @@ def download_and_parse_files() -> Iterable[Callable[..., Generator[Dict, None, N
             yield lambda: parse_one_file(filename)
 
 
-def _write_rows_to_file(
+def _write_rows_to_pipe(
+    pipe_dir: str, revision_maker: Callable[..., Iterable[Dict]], fields: List[str]
+):
+    pipe_name = f"revisions-{os.getpid()}-{str(time.time()).replace('.', '')}.pipe"
+    os.mkfifo(pipe_name)
+    print(f"{timestr()} writing out to {pipe_name}... 🖋️")
+    i = 0
+    with open(os.path.join(pipe_dir, pipe_name), "w") as out:
+        writer = csv.DictWriter(out, fields)
+        writer.writeheader()
+        for revision in revision_maker():
+            writer.writerow(revision)
+            i += 1
+        return i
+
+
+def _write_rows_to_bzipped_csv(
     revision_maker: Callable[..., Iterable[Dict]],
-    filename: str,
-    to_pipe: bool,
+    filename: Optional[str],
     fields: List[str],
     process_buffer_length: int,
 ):
-    def _write(out):
-        i = 0
+    i = 0
+    with bz2.open(filename, "at", newline="") as out:
         writer = csv.DictWriter(out, fields)
         buffer = []
         for revision in revision_maker():
@@ -372,18 +387,10 @@ def _write_rows_to_file(
             i += 1
         return i
 
-    if to_pipe:
-        with open(filename, "w") as out:
-            return _write(out)
-    else:
-        with bz2.open(filename, "at", newline="") as out:
-            return _write(out)
-
 
 def write_to_csv(
-    output_filename: str,
+    output_filename: Optional[str],
     revision_iterator_functions: Iterable[Callable[..., Iterable[Dict]]],
-    to_pipe: bool = False,
 ) -> None:
     def _write():
         i = 0
@@ -397,16 +404,29 @@ def write_to_csv(
                     for future in completed_readers:
                         i += future.result()
                         print(f"{timestr()} wrote revision #{i}")
-                active_readers.add(
-                    executor.submit(
-                        _write_rows_to_file,
-                        revision_maker,
-                        output_filename,
-                        to_pipe,
-                        FIELDS,
-                        int(math.floor(config["backlog"] / config["concurrent_reads"])),
+                if output_filename is None:
+                    active_readers.add(
+                        executor.submit(
+                            _write_rows_to_pipe,
+                            config["pipe_dir"],
+                            revision_maker,
+                            FIELDS,
+                        )
                     )
-                )
+                else:
+                    active_readers.add(
+                        executor.submit(
+                            _write_rows_to_bzipped_csv,
+                            revision_maker,
+                            output_filename,
+                            FIELDS,
+                            int(
+                                math.floor(
+                                    config["backlog"] / config["concurrent_reads"]
+                                )
+                            ),
+                        )
+                    )
             while len(active_readers) > 0:
                 completed_readers, active_readers = wait(
                     active_readers, return_when=FIRST_COMPLETED, timeout=120
@@ -415,12 +435,8 @@ def write_to_csv(
                     i += future.result()
                     print(f"{timestr()} wrote revision #{i}")
 
-    if to_pipe:
-        with open(output_filename, "w") as out:
-            writer = csv.DictWriter(out, FIELDS)
-            writer.writeheader()
-            out.flush()
-            _write()  # don't close the pipe until all revisions have been written
+    if output_filename is None:
+        _write()
     else:
         with bz2.open(output_filename, "wt", newline="") as out:
             writer = csv.DictWriter(out, FIELDS)
@@ -527,10 +543,11 @@ def write_to_database(
 )
 @click.option(
     "-p",
-    "--pipe",
-    "pipe",
-    default=None,
-    help="write revisions as an uncompressed csv to the passed named pipe.",
+    "--pipe-dir",
+    "pipe_dir",
+    default=False,
+    help="write revisions as uncompressed csvs to a series of named pipes. Pipes are named "
+    "revisions-<process number>-<numeric time string>.pipe, and are placed in the passed directory.",
 )
 def run(
     date,
@@ -543,7 +560,7 @@ def run(
     concurrent_reads,
     insert_multiple_values,
     num_db_connections,
-    pipe,
+    pipe_dir,
 ):
     config["date"] = date
     config["dump_page_url"] = f"https://dumps.wikimedia.org/enwiki/{date}/"
@@ -558,7 +575,7 @@ def run(
     config["insert_multiple_values"] = insert_multiple_values
     config["num_db_connections"] = num_db_connections
     config["backlog"] = 300 if low_memory else 5000
-    config["pipe"] = pipe
+    config["pipe_dir"] = pipe_dir
 
     if concurrent_reads < 1:
         raise ValueError("concurrent_reads must be at least 1.")
@@ -576,12 +593,8 @@ def run(
             revision_iterator_functions = download_and_parse_files()
 
             # write collected revisions to output.
-            if pipe is not None:
-                if not os.path.exists(pipe):
-                    raise FileNotFoundError(
-                        f"named pipe not found at: {pipe}\nhint: initialize pipe with mkfifo  🕳️"
-                    )
-                write_to_csv(pipe, revision_iterator_functions, True)
+            if pipe_dir is not None:
+                write_to_csv(None, revision_iterator_functions)
             elif use_database:
                 write_to_database(revision_iterator_functions)
             else:
