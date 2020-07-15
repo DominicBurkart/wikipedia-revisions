@@ -353,10 +353,11 @@ def _write_rows_to_pipe(
     pipe_dir: str, revision_maker: Callable[..., Iterable[Dict]], fields: List[str]
 ):
     pipe_name = f"revisions-{os.getpid()}-{str(time.time()).replace('.', '')}.pipe"
-    os.mkfifo(pipe_name)
+    pipe_path = os.path.join(pipe_dir, pipe_name)
+    os.mkfifo(pipe_path)
     print(f"{timestr()} writing out to {pipe_name}... 🖋️")
     i = 0
-    with open(os.path.join(pipe_dir, pipe_name), "w") as out:
+    with open(pipe_path, "w") as out:
         writer = csv.DictWriter(out, fields)
         writer.writeheader()
         for revision in revision_maker():
