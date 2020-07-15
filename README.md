@@ -57,7 +57,7 @@ Use `--help` to see the available options:
 python3 -m wikipedia_revisions.download --help
 ```
 
-(Note: if using PyPy, you can just substitute `pypy3` for `python3` 
+Note: if using PyPy, you can just substitute `pypy3` for `python3` 
 for any of these commands, for example:
 ```shell
 pypy3 -m wikipedia_revisions.download --help
