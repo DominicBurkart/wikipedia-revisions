@@ -22,9 +22,13 @@ Revisions are output with the following fields:
 The id, timestamp, page_id, page_title, and page_ns cannot be null. All other fields may be null.
 
 System requirements:
-- 4gb memory
-- ~3tb storage
+- 4gb memory (more is better)
 - python 3 & pip pre-installed
+- large storage (varying by output)
+
+The storage needs for the output vary by format. Writing to a postgres 
+database will require tens of terabytes of storage, while writing to a 
+single .csv.bzip2 will (at the time of writing) require less than 10 terabytes.
 
 I wrote a [blog post](https://dominicburkart.com/blog/2020/big_data_and_small_computers.html) on some of the project 
 goals and technical choices.
