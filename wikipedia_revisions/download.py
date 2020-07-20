@@ -18,7 +18,7 @@ from typing import Optional, Dict, Generator, Iterable, Tuple, Callable, List
 import fcntl
 import math
 from queue import Queue
-
+import traceback
 
 import click
 import requests
@@ -64,7 +64,12 @@ def download_update_file(session: requests.Session, url: str) -> str:
                 for chunk in resp.iter_content(chunk_size=CHUNK_SIZE):
                     file.write(chunk)
             break
-        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError):
+        except (
+            requests.exceptions.Timeout,
+            requests.exceptions.ConnectionError,
+            ValueError,
+        ):
+            traceback.print_exc()
             retries += 1
             print(
                 f"{timestr()} timeout for {url}: sleeping 60 seconds and restarting download... (retry #{retries}) ↩️"
