@@ -275,7 +275,7 @@ def get_hash(filename: str) -> str:
     return hash.hexdigest()
 
 
-def check_hash(verified_files: VerifiedFilesRecord, filename: str) -> Optional[Dict]:
+def check_hash(verified_files: VerifiedFilesRecord, filename: str) -> Optional[str]:
     if filename not in verified_files:
         print(f"{timestr()} checking hash for {filename}... 📋")
         file_hash = get_hash(filename)
@@ -442,7 +442,6 @@ def write_to_csv(
         with bz2.open(output_filename, "wt", newline="") as out:
             writer = csv.DictWriter(out, FIELDS)
             writer.writeheader()
-            out.flush()
         _write()
 
 
