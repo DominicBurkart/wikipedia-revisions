@@ -13,7 +13,7 @@ from enum import Enum
 import datetime
 from functools import partial
 import os
-from queue import SimpleQueue, Empty
+from queue import Queue, Empty
 
 import dill
 
@@ -214,7 +214,7 @@ def test_peek_ahead_range():
         assert list(range(10)) == list(peek_ahead(ex, range(10)))
 
 
-def queue_to_iterator(q: SimpleQueue, timeout: float = 10):
+def queue_to_iterator(q: Queue, timeout: float = 10):
     try:
         while True:
             yield q.get(timeout=timeout)

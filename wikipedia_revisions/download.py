@@ -17,7 +17,7 @@ from concurrent.futures import (
 from typing import Optional, Dict, Generator, Iterable, Tuple, Callable, List
 import fcntl
 import math
-from queue import SimpleQueue
+from queue import Queue
 
 
 import click
@@ -172,7 +172,7 @@ def parse_one_file(filename: str) -> Generator[Dict, None, None]:
 
 def verify_files(
     download_file_and_url: Iterable[Tuple[str, str]],
-    bad_urls_queue: SimpleQueue,
+    bad_urls_queue: Queue,
     executor: ThreadPoolExecutor,
 ) -> Generator[str, None, None]:
     verified_files = VerifiedFilesRecord()
@@ -320,7 +320,7 @@ def download_and_parse_files() -> Iterable[Callable[..., Generator[Dict, None, N
     print(f"{timestr()} parsing dump directory...  🗺️🗺️")
 
     # read history file links in dump summary
-    updates_urls = SimpleQueue()
+    updates_urls = Queue()
     for url in set(
         map(
             full_dump_url_from_partial,
