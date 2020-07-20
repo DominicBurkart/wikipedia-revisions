@@ -64,11 +64,7 @@ def download_update_file(session: requests.Session, url: str) -> str:
                 for chunk in resp.iter_content(chunk_size=CHUNK_SIZE):
                     file.write(chunk)
             break
-        except (
-            requests.exceptions.Timeout,
-            requests.exceptions.ConnectionError,
-            ValueError,
-        ):
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError):
             traceback.print_exc()
             retries += 1
             print(
@@ -339,12 +335,12 @@ def download_and_parse_files() -> Iterable[Callable[..., Generator[Dict, None, N
 
     with ThreadPoolExecutor() as executor:
         # download & process the history files
-        file_and_url = unordered_incremental_executor_map(
+        file_and_url = peek_ahead(
             executor,
-            lambda url: (download_update_file(session, url), url),
-            queue_to_iterator(updates_urls),
-            max_parallel=2,
-            max_backlog=2 if config["low_storage"] else -1,
+            map(
+                lambda url: (download_update_file(session, url), url),
+                queue_to_iterator(updates_urls),
+            ),
         )
 
         # verify files were correctly downloaded
@@ -478,9 +474,8 @@ def write_to_database(
     default=True,
     help="Cut performance to decrease storage requirements. Deletes "
     "files when they are exhausted and keeps a limited number of "
-    ".xml.bz2 files on disk at any time. If --large-storage, eagerly "
-    "downloads all xml.bz2 and never deletes intermediary xml.bz2 "
-    "files.",
+    ".xml.bz2 files on disk at any time. If --large-storage, "
+    "downloads all xml.bz2 files and never deletes them.",
 )
 @click.option(
     "--database/--csv",
