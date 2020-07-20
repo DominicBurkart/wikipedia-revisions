@@ -17,6 +17,7 @@ from concurrent.futures import (
 from typing import Optional, Dict, Generator, Iterable, Tuple, Callable, List
 import fcntl
 import math
+from queue import SimpleQueue
 
 
 import click
@@ -26,7 +27,7 @@ from wikipedia_revisions.utils import (
     timestr,
     peek_ahead,
     unordered_incremental_executor_map,
-    LazyList,
+    queue_to_iterator,
 )
 
 config = dict()
@@ -171,7 +172,7 @@ def parse_one_file(filename: str) -> Generator[Dict, None, None]:
 
 def verify_files(
     download_file_and_url: Iterable[Tuple[str, str]],
-    append_bad_urls,
+    bad_urls_queue: SimpleQueue,
     executor: ThreadPoolExecutor,
 ) -> Generator[str, None, None]:
     verified_files = VerifiedFilesRecord()
@@ -204,7 +205,7 @@ def verify_files(
         if filename:
             yield filename
         else:
-            append_bad_urls.append(url)
+            bad_urls_queue.put(url)
 
 
 class VerifiedFilesRecord:
@@ -319,7 +320,8 @@ def download_and_parse_files() -> Iterable[Callable[..., Generator[Dict, None, N
     print(f"{timestr()} parsing dump directory...  🗺️🗺️")
 
     # read history file links in dump summary
-    updates_urls = LazyList(
+    updates_urls = SimpleQueue()
+    for url in set(
         map(
             full_dump_url_from_partial,
             filter(
@@ -327,21 +329,22 @@ def download_and_parse_files() -> Iterable[Callable[..., Generator[Dict, None, N
                 re.findall('href="(.+?)"', dump_page.text),
             ),
         )
-    )
+    ):
+        updates_urls.put(url)
 
     with ThreadPoolExecutor() as executor:
         # download & process the history files
         file_and_url = unordered_incremental_executor_map(
             executor,
             lambda url: (download_update_file(session, url), url),
-            updates_urls,
+            queue_to_iterator(updates_urls),
             max_parallel=2,
             max_backlog=2 if config["low_storage"] else -1,
         )
 
         # verify files were correctly downloaded
         verified_files = verify_files(
-            file_and_url, append_bad_urls=updates_urls, executor=executor
+            file_and_url, bad_urls_queue=updates_urls, executor=executor
         )
 
         # create functions that read and parse valid files
