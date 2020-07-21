@@ -1,4 +1,4 @@
-from typing import Tuple, Iterable, Callable, Generator, TypeVar, Any
+from typing import Iterable, Callable, Generator, TypeVar, Any
 import threading
 import multiprocessing
 from concurrent.futures import (
@@ -13,6 +13,7 @@ from enum import Enum
 import datetime
 from functools import partial
 import os
+from queue import Queue, Empty
 
 import dill
 
@@ -179,110 +180,6 @@ def _loader(
             future.result()
 
 
-class LazyList:
-    """
-    memorizes the results of an iterable, allowing for lazy list construction. Not thread-safe. Behavior on this is
-    not well protected.
-
-    Be careful about mutating the contents of the list.
-    """
-
-    def __init__(self, iterable: Iterable):
-        self.all = []
-        self.iterator = iter(iterable)
-        self.appended = []
-
-    def __iter__(self) -> Generator:
-        for value in self.all:
-            yield value
-        for value in self.iterator:
-            self.all.append(value)
-            yield value
-        for value in self.appended:
-            self.all.append(value)
-            yield value
-        self.appended.clear()
-
-    def __getitem__(self, item):
-        if isinstance(item, int):
-            if len(self.all) > item:
-                return self.all[item]
-            i = len(self.all)
-            for value in self.iterator:
-                self.all.append(value)
-                if i == item:
-                    return value
-                i += 1
-            for value in self.appended:
-                self.all.append(value)
-                if i == item:
-                    return value
-            self.appended.clear()
-            raise IndexError
-        elif isinstance(item, slice):
-            if item.start < 0:
-                raise IndexError
-            if item.stop < item.start:
-                raise IndexError
-            if len(self.all) < item.stop:
-                self[item.stop - 1]  # memorize necessary values
-            return self.all[item]
-        raise NotImplementedError
-
-    def append(self, value) -> None:
-        self.appended.append(value)
-
-
-def _test_fn_iden(x):
-    return x
-
-
-def _test_fn_append(appendable, v):
-    appendable.append(v)
-
-
-def test_lazy_list():
-    li = LazyList(iter([1, 2, 3]))
-    assert list(li) == [1, 2, 3]
-    assert list(li) == [1, 2, 3]
-
-    l2 = LazyList(range(1, 4))
-    for v in range(4, 7):
-        l2.append(v)
-    assert list(l2) == list(range(1, 7))
-    assert list(l2) == list(range(1, 7))
-
-    l3 = LazyList(range(10))
-    l4 = LazyList(l3)
-    assert list(l3) == list(l4)
-    assert list(l3) == list(l4)
-    l4.append(10)
-    assert list(l3) + [10] == list(l4)
-
-    l5 = LazyList(range(10))
-    for _ in l5:
-        assert list(l5) == list(range(10))
-
-    l6 = LazyList(range(2))
-    it1 = iter(l6)
-    it2 = iter(l6)
-    next(it2)
-    next(it2)  # it2 is now exhausted, but hasn't raised StopIteration yet.
-    l6.append("nice")
-    assert next(it1) == 0
-    assert next(it1) == 1
-    assert next(it1) == "nice"
-    assert next(it2) == "nice"
-    l6.append("final")
-    assert next(it1) == "final"
-    assert next(it2) == "final"
-
-
-def test_lazy_list_slicing():
-    x = LazyList(range(10))
-    assert x[4:6] == [4, 5]
-
-
 T = TypeVar("T")
 
 
@@ -315,6 +212,14 @@ def test_peek_ahead_iter():
 def test_peek_ahead_range():
     with ThreadPoolExecutor() as ex:
         assert list(range(10)) == list(peek_ahead(ex, range(10)))
+
+
+def queue_to_iterator(q: Queue, timeout: float = 10):
+    try:
+        while True:
+            yield q.get(timeout=timeout)
+    except Empty:
+        pass
 
 
 FnInputType = TypeVar("FnInputType")
@@ -393,28 +298,6 @@ def test_unordered_incremental_executor_map():
     with ThreadPoolExecutor() as ex:
         out = unordered_incremental_executor_map(ex, lambda x: x, range(5))
         assert set(out) == set(range(5))
-
-
-def lazy_dezip(it: Iterable[Tuple]) -> Iterable[Iterable]:
-    """
-    assumes that each tuple in the iterable has the same length. Stores the whole input in memory until the last
-    iterator is released.
-    """
-    try:
-        container = LazyList(it)
-        first = next(iter(container))
-        n_zipped = len(first)
-        return map(lambda i: (row[i] for row in container), range(n_zipped))
-    except StopIteration:
-        raise RuntimeError("lazy_dezip received an empty iterator")
-
-
-def test_lazy_dezip():
-    abc, cde, efg, hij = lazy_dezip(zip("abc", "cde", "efg", "hij"))
-    assert "".join(abc) == "abc"
-    assert "".join(cde) == "cde"
-    assert "".join(efg) == "efg"
-    assert "".join(hij) == "hij"
 
 
 def timestr() -> str:

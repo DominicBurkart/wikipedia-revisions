@@ -17,7 +17,8 @@ from concurrent.futures import (
 from typing import Optional, Dict, Generator, Iterable, Tuple, Callable, List
 import fcntl
 import math
-
+from queue import Queue
+import traceback
 
 import click
 import requests
@@ -26,7 +27,7 @@ from wikipedia_revisions.utils import (
     timestr,
     peek_ahead,
     unordered_incremental_executor_map,
-    LazyList,
+    queue_to_iterator,
 )
 
 config = dict()
@@ -64,6 +65,7 @@ def download_update_file(session: requests.Session, url: str) -> str:
                     file.write(chunk)
             break
         except (requests.exceptions.Timeout, requests.exceptions.ConnectionError):
+            traceback.print_exc()
             retries += 1
             print(
                 f"{timestr()} timeout for {url}: sleeping 60 seconds and restarting download... (retry #{retries}) ↩️"
@@ -171,7 +173,7 @@ def parse_one_file(filename: str) -> Generator[Dict, None, None]:
 
 def verify_files(
     download_file_and_url: Iterable[Tuple[str, str]],
-    append_bad_urls,
+    bad_urls_queue: Queue,
     executor: ThreadPoolExecutor,
 ) -> Generator[str, None, None]:
     verified_files = VerifiedFilesRecord()
@@ -204,7 +206,7 @@ def verify_files(
         if filename:
             yield filename
         else:
-            append_bad_urls.append(url)
+            bad_urls_queue.put(url)
 
 
 class VerifiedFilesRecord:
@@ -319,7 +321,8 @@ def download_and_parse_files() -> Iterable[Callable[..., Generator[Dict, None, N
     print(f"{timestr()} parsing dump directory...  🗺️🗺️")
 
     # read history file links in dump summary
-    updates_urls = LazyList(
+    updates_urls = Queue()
+    for url in set(
         map(
             full_dump_url_from_partial,
             filter(
@@ -327,21 +330,22 @@ def download_and_parse_files() -> Iterable[Callable[..., Generator[Dict, None, N
                 re.findall('href="(.+?)"', dump_page.text),
             ),
         )
-    )
+    ):
+        updates_urls.put(url)
 
     with ThreadPoolExecutor() as executor:
         # download & process the history files
-        file_and_url = unordered_incremental_executor_map(
+        file_and_url = peek_ahead(
             executor,
-            lambda url: (download_update_file(session, url), url),
-            updates_urls,
-            max_parallel=2,
-            max_backlog=2 if config["low_storage"] else -1,
+            map(
+                lambda url: (download_update_file(session, url), url),
+                queue_to_iterator(updates_urls),
+            ),
         )
 
         # verify files were correctly downloaded
         verified_files = verify_files(
-            file_and_url, append_bad_urls=updates_urls, executor=executor
+            file_and_url, bad_urls_queue=updates_urls, executor=executor
         )
 
         # create functions that read and parse valid files
@@ -470,9 +474,8 @@ def write_to_database(
     default=True,
     help="Cut performance to decrease storage requirements. Deletes "
     "files when they are exhausted and keeps a limited number of "
-    ".xml.bz2 files on disk at any time. If --large-storage, eagerly "
-    "downloads all xml.bz2 and never deletes intermediary xml.bz2 "
-    "files.",
+    ".xml.bz2 files on disk at any time. If --large-storage, "
+    "downloads all xml.bz2 files and never deletes them.",
 )
 @click.option(
     "--database/--csv",
