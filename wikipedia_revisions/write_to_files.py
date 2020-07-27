@@ -97,6 +97,10 @@ def write_to_csv(
                 for future in completed_readers:
                     i += future.result()
                     print(f"{timestr()} wrote revision #{i}")
+                completed_readers = {}
+            for future in completed_readers:
+                i += future.result()
+                print(f"{timestr()} wrote revision #{i}")
 
     if output_filename is None:
         _write()
