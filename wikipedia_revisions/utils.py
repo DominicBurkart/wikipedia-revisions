@@ -71,7 +71,7 @@ def test_queue_to_iterator_continue_param():
     for i in range(10):
         q.put(i)
 
-    return list(queue_to_iterator(q, should_continue=lambda: not q.empty())) == list(
+    assert list(queue_to_iterator(q, should_continue=lambda: not q.empty())) == list(
         range(10)
     )
 
