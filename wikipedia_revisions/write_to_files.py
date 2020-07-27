@@ -5,8 +5,10 @@ import math
 import os
 from concurrent.futures import ProcessPoolExecutor, wait, FIRST_COMPLETED
 from typing import Callable, Iterable, Dict, List, Optional
+import time
 
 from wikipedia_revisions import config, FIELDS
+from wikipedia_revisions.utils import timestr
 
 
 def _write_rows_to_pipe(
