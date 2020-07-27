@@ -8,32 +8,15 @@ import threading
 import time
 import traceback
 import xml.etree.ElementTree as ET
-from concurrent.futures import (
-    ThreadPoolExecutor,
-)
+from concurrent.futures import ThreadPoolExecutor
 from queue import Queue
 from typing import Optional, Dict, Generator, Iterable, Tuple, Callable
 
 import click
 import requests
 
+from wikipedia_revisions import config
 from wikipedia_revisions.utils import timestr, peek_ahead, queue_to_iterator
-
-config = dict()
-
-FIELDS = [
-    "id",
-    "parent_id",
-    "page_title",
-    "contributor_id",
-    "contributor_name",
-    "contributor_ip",
-    "timestamp",
-    "text",
-    "comment",
-    "page_id",
-    "page_ns",
-]
 
 
 def download_update_file(session: requests.Session, url: str) -> str:

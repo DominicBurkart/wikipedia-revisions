@@ -6,7 +6,7 @@ import os
 from concurrent.futures import ProcessPoolExecutor, wait, FIRST_COMPLETED
 from typing import Callable, Iterable, Dict, List, Optional
 
-from wikipedia_revisions.download import config, FIELDS
+from wikipedia_revisions import config, FIELDS
 
 
 def _write_rows_to_pipe(
