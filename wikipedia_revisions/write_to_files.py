@@ -12,20 +12,28 @@ from wikipedia_revisions.utils import timestr
 
 
 def _write_rows_to_pipe(
-    pipe_dir: str, revision_maker: Callable[..., Iterable[Dict]], fields: List[str]
+    pipe_dir: str,
+    revision_maker: Callable[..., Iterable[Dict]],
+    fields: List[str],
+    process_buffer_length: int,
 ):
     pipe_name = f"revisions-{os.getpid()}-{str(time.time()).replace('.', '')}.pipe"
     pipe_path = os.path.join(pipe_dir, pipe_name)
     os.mkfifo(pipe_path)
     print(f"{timestr()} writing out to {pipe_name}... 🖋️")
     i = 0
+    buffer = []
     with open(pipe_path, "w") as out:
         writer = csv.DictWriter(out, fields)
         writer.writeheader()
         for revision in revision_maker():
-            writer.writerow(revision)
-            i += 1
-        return i
+            buffer.append(revision)
+            if len(buffer) >= process_buffer_length:
+                for rev in buffer:
+                    writer.writerow(rev)
+                i += len(buffer)
+                buffer = []
+    return i
 
 
 def _write_rows_to_bzipped_csv(
@@ -74,6 +82,11 @@ def write_to_csv(
                             config["pipe_dir"],
                             revision_maker,
                             FIELDS,
+                            int(
+                                math.floor(
+                                    config["backlog"] / config["concurrent_reads"]
+                                )
+                            ),
                         )
                     )
                 else:
