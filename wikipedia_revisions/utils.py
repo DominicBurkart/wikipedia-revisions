@@ -18,7 +18,7 @@ class Exhausted:
 
 def peek_ahead(executor: Executor, iterable: Iterable[T]) -> Iterable[T]:
     """
-    computes the next value of an iterable in a different threads
+    computes the next value of an iterable in a different thread
 
     :param executor:
     :param iterable:
@@ -45,35 +45,6 @@ def test_peek_ahead_iter():
 def test_peek_ahead_range():
     with ThreadPoolExecutor() as ex:
         assert list(range(10)) == list(peek_ahead(ex, range(10)))
-
-
-def queue_to_iterator(
-    q: Queue, timeout: float = 10, should_continue: Callable[[], bool] = lambda: True
-):
-    try:
-        while should_continue():
-            yield q.get(timeout=timeout)
-            q.task_done()
-    except Empty:
-        pass
-
-
-def test_queue_to_iterator():
-    q = Queue()
-    q.put(1)
-    q.put(2)
-    q.put(3)
-    assert list(queue_to_iterator(q)) == [1, 2, 3]
-
-
-def test_queue_to_iterator_continue_param():
-    q = Queue()
-    for i in range(10):
-        q.put(i)
-
-    assert list(queue_to_iterator(q, should_continue=lambda: not q.empty())) == list(
-        range(10)
-    )
 
 
 def timestr() -> str:
