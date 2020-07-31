@@ -17,11 +17,13 @@ def _write_rows_to_pipe(
     fields: List[str],
     process_buffer_length: int,
 ):
+    # instantiate pipe
     pipe_name = f"revisions-{os.getpid()}-{str(time.time()).replace('.', '')}.pipe"
     pipe_path = os.path.join(pipe_dir, pipe_name)
     os.mkfifo(pipe_path)
+
     print(f"{timestr()} writing out to {pipe_name}... 🖋️")
-    i = 0
+    revisions_written = 0
     buffer = []
     with open(pipe_path, "w") as out:
         writer = csv.DictWriter(out, fields)
@@ -31,9 +33,9 @@ def _write_rows_to_pipe(
             if len(buffer) >= process_buffer_length:
                 for rev in buffer:
                     writer.writerow(rev)
-                i += len(buffer)
+                revisions_written += len(buffer)
                 buffer = []
-    return i
+    return revisions_written
 
 
 def _write_rows_to_bzipped_csv(
@@ -42,7 +44,7 @@ def _write_rows_to_bzipped_csv(
     fields: List[str],
     process_buffer_length: int,
 ):
-    i = 0
+    revisions_written = 0
     with bz2.open(filename, "at", newline="") as out:
         writer = csv.DictWriter(out, fields)
         buffer = []
@@ -55,70 +57,67 @@ def _write_rows_to_bzipped_csv(
                 out.flush()
                 fcntl.flock(out, fcntl.LOCK_UN)
                 buffer = []
-            i += 1
-        return i
+            revisions_written += 1
+    return revisions_written
 
 
 def write_to_csv(
-    output_filename: Optional[str],
+    single_output_filename: Optional[str],
     revision_iterator_functions: Iterable[Callable[..., Iterable[Dict]]],
 ) -> None:
-    def _write():
-        i = 0
-        active_readers = set()
-        with ProcessPoolExecutor(max_workers=config["concurrent_reads"]) as executor:
-            for revision_maker in revision_iterator_functions:
-                while len(active_readers) >= config["concurrent_reads"]:
-                    completed_readers, active_readers = wait(
-                        active_readers, return_when=FIRST_COMPLETED, timeout=60
-                    )
-                    for future in completed_readers:
-                        i += future.result()
-                        print(f"{timestr()} wrote revision #{i}")
-                if output_filename is None:
-                    active_readers.add(
-                        executor.submit(
-                            _write_rows_to_pipe,
-                            config["pipe_dir"],
-                            revision_maker,
-                            FIELDS,
-                            int(
-                                math.floor(
-                                    config["backlog"] / config["concurrent_reads"]
-                                )
-                            ),
-                        )
-                    )
-                else:
-                    active_readers.add(
-                        executor.submit(
-                            _write_rows_to_bzipped_csv,
-                            revision_maker,
-                            output_filename,
-                            FIELDS,
-                            int(
-                                math.floor(
-                                    config["backlog"] / config["concurrent_reads"]
-                                )
-                            ),
-                        )
-                    )
-            while len(active_readers) > 0:
-                completed_readers, active_readers = wait(
-                    active_readers, return_when=FIRST_COMPLETED, timeout=120
-                )
-                for future in completed_readers:
-                    i += future.result()
-                    print(f"{timestr()} wrote revision #{i}")
-                completed_readers = {}
-            for future in completed_readers:
-                i += future.result()
-                print(f"{timestr()} wrote revision #{i}")
-
-    if output_filename is None:
-        _write()
-    else:
-        with bz2.open(output_filename, "wt", newline="") as out:
+    if single_output_filename is not None:
+        with bz2.open(single_output_filename, "wt", newline="") as out:
             writer = csv.DictWriter(out, FIELDS)
             writer.writeheader()
-        _write()
+
+    revisions_written = 0
+    active_readers = set()
+    backlog_per_process = int(
+        math.floor(config["backlog"] / config["concurrent_reads"])
+    )
+    with ProcessPoolExecutor(max_workers=config["concurrent_reads"]) as executor:
+        for revision_maker in revision_iterator_functions:
+            if single_output_filename is not None:
+                active_readers.add(
+                    executor.submit(
+                        _write_rows_to_bzipped_csv,
+                        revision_maker,
+                        single_output_filename,
+                        FIELDS,
+                        backlog_per_process,
+                    )
+                )
+            else:
+                active_readers.add(
+                    executor.submit(
+                        _write_rows_to_pipe,
+                        config["pipe_dir"],
+                        revision_maker,
+                        FIELDS,
+                        backlog_per_process,
+                    )
+                )
+
+            # when at capacity, wait for current readers to finish
+            while len(active_readers) >= config["concurrent_reads"]:
+                completed_readers, active_readers = wait(
+                    active_readers, return_when=FIRST_COMPLETED, timeout=60
+                )
+                for future in completed_readers:
+                    revisions_written += future.result()
+                    print(f"{timestr()} wrote revision #{revisions_written}")
+
+        # wait for last readers to finish
+        while len(active_readers) > 0:
+            completed_readers, active_readers = wait(
+                active_readers, return_when=FIRST_COMPLETED, timeout=120
+            )
+            for future in completed_readers:
+                revisions_written += future.result()
+                print(f"{timestr()} wrote revision #{revisions_written}")
+            completed_readers = {}
+
+        # count any remaining completed readers
+        for future in completed_readers:
+            revisions_written += future.result()
+            print(f"{timestr()} wrote revision #{revisions_written}")
