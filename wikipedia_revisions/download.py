@@ -1,5 +1,4 @@
 import bz2
-import csv
 import errno
 import hashlib
 import os
@@ -7,47 +6,18 @@ import platform
 import re
 import threading
 import time
-import xml.etree.ElementTree as ET
-from concurrent.futures import (
-    ThreadPoolExecutor,
-    ProcessPoolExecutor,
-    wait,
-    FIRST_COMPLETED,
-)
-from typing import Optional, Dict, Generator, Iterable, Tuple, Callable, List
-import fcntl
-import math
-from queue import Queue
 import traceback
+import xml.etree.ElementTree as ET
+from typing import Optional, Dict, Generator, Iterable, Callable, Set
 
 import click
 import requests
 
-from wikipedia_revisions.utils import (
-    timestr,
-    peek_ahead,
-    unordered_incremental_executor_map,
-    queue_to_iterator,
-)
-
-config = dict()
-
-FIELDS = [
-    "id",
-    "parent_id",
-    "page_title",
-    "contributor_id",
-    "contributor_name",
-    "contributor_ip",
-    "timestamp",
-    "text",
-    "comment",
-    "page_id",
-    "page_ns",
-]
+from wikipedia_revisions import config
+from wikipedia_revisions.utils import timestr
 
 
-def download_update_file(session: requests.Session, url: str) -> str:
+def download_bz2_file(session: requests.Session, url: str) -> str:
     CHUNK_SIZE = 1024 * 1024 * 5
     filename = url.split("/")[-1]
     retries = 0
@@ -72,6 +42,29 @@ def download_update_file(session: requests.Session, url: str) -> str:
             )
             time.sleep(60)
     return filename
+
+
+def download_and_verify_bz2_files(
+    session: requests.Session, update_urls: Set[str]
+) -> Generator[str, None, None]:
+    verified_files = VerifiedFilesRecord()
+
+    # perform checksum
+    if config["low_storage"]:
+        print(
+            f"{timestr()} [low storage mode] "
+            f"deleting all records of previously verified files. 🔥"
+        )
+        verified_files.remove_local_file_verification()
+
+    while len(update_urls) > 0:
+        url = update_urls.pop()
+        unverified_filename = download_bz2_file(session, url)
+        verified_filename = check_hash(verified_files, unverified_filename)
+        if verified_filename is not None:
+            yield verified_filename
+        else:
+            update_urls.add(url)
 
 
 class MalformattedInput(Exception):
@@ -171,44 +164,6 @@ def parse_one_file(filename: str) -> Generator[Dict, None, None]:
         os.remove(filename)
 
 
-def verify_files(
-    download_file_and_url: Iterable[Tuple[str, str]],
-    bad_urls_queue: Queue,
-    executor: ThreadPoolExecutor,
-) -> Generator[str, None, None]:
-    verified_files = VerifiedFilesRecord()
-
-    # perform checksum
-    if config["low_storage"]:
-        print(
-            f"{timestr()} [low storage mode] "
-            f"deleting all records of previously verified files. 🔥"
-        )
-        verified_files.remove_local_file_verification()
-        filenames_and_urls = peek_ahead(
-            executor,
-            map(
-                lambda tup: (check_hash(verified_files, tup[0]), tup[1]),
-                download_file_and_url,
-            ),
-        )
-    else:
-        filenames_and_urls = unordered_incremental_executor_map(
-            executor,
-            lambda tup: (check_hash(verified_files, tup[0]), tup[1]),
-            download_file_and_url,
-            max_parallel=os.cpu_count() or 4,
-            max_backlog=4 * (os.cpu_count() or 4),
-        )
-
-    # yield filenames that passed checksum
-    for filename, url in filenames_and_urls:
-        if filename:
-            yield filename
-        else:
-            bad_urls_queue.put(url)
-
-
 class VerifiedFilesRecord:
     """
     retain the hash and basename for each downloaded file. downloads the
@@ -304,7 +259,6 @@ def full_dump_url_from_partial(partial: str):
 
 
 def download_and_parse_files() -> Iterable[Callable[..., Generator[Dict, None, None]]]:
-    # todo automatically find the last completed bz2 history job
     print(f"{timestr()} requesting dump directory... 📚")
     session = requests.Session()
     session.headers.update(
@@ -321,8 +275,7 @@ def download_and_parse_files() -> Iterable[Callable[..., Generator[Dict, None, N
     print(f"{timestr()} parsing dump directory...  🗺️🗺️")
 
     # read history file links in dump summary
-    updates_urls = Queue()
-    for url in set(
+    bz2_urls = set(
         map(
             full_dump_url_from_partial,
             filter(
@@ -330,123 +283,23 @@ def download_and_parse_files() -> Iterable[Callable[..., Generator[Dict, None, N
                 re.findall('href="(.+?)"', dump_page.text),
             ),
         )
-    ):
-        updates_urls.put(url)
+    )
 
-    with ThreadPoolExecutor() as executor:
-        # download & process the history files
-        file_and_url = peek_ahead(
-            executor,
-            map(
-                lambda url: (download_update_file(session, url), url),
-                queue_to_iterator(updates_urls),
-            ),
-        )
+    # download & verify history files
+    verified_files = download_and_verify_bz2_files(session, bz2_urls)
 
-        # verify files were correctly downloaded
-        verified_files = verify_files(
-            file_and_url, bad_urls_queue=updates_urls, executor=executor
-        )
-
-        # create functions that read and parse valid files
-        for filename in verified_files:
-            yield lambda: parse_one_file(filename)
-
-
-def _write_rows_to_pipe(
-    pipe_dir: str, revision_maker: Callable[..., Iterable[Dict]], fields: List[str]
-):
-    pipe_name = f"revisions-{os.getpid()}-{str(time.time()).replace('.', '')}.pipe"
-    pipe_path = os.path.join(pipe_dir, pipe_name)
-    os.mkfifo(pipe_path)
-    print(f"{timestr()} writing out to {pipe_name}... 🖋️")
-    i = 0
-    with open(pipe_path, "w") as out:
-        writer = csv.DictWriter(out, fields)
-        writer.writeheader()
-        for revision in revision_maker():
-            writer.writerow(revision)
-            i += 1
-        return i
-
-
-def _write_rows_to_bzipped_csv(
-    revision_maker: Callable[..., Iterable[Dict]],
-    filename: Optional[str],
-    fields: List[str],
-    process_buffer_length: int,
-):
-    i = 0
-    with bz2.open(filename, "at", newline="") as out:
-        writer = csv.DictWriter(out, fields)
-        buffer = []
-        for revision in revision_maker():
-            buffer.append(revision)
-            if len(buffer) >= process_buffer_length:
-                fcntl.flock(out, fcntl.LOCK_EX)
-                for rev in buffer:
-                    writer.writerow(rev)
-                out.flush()
-                fcntl.flock(out, fcntl.LOCK_UN)
-                buffer = []
-            i += 1
-        return i
+    # create functions that read and parse valid files
+    for filename in verified_files:
+        yield lambda: parse_one_file(filename)
 
 
 def write_to_csv(
-    output_filename: Optional[str],
+    filename: Optional[str],
     revision_iterator_functions: Iterable[Callable[..., Iterable[Dict]]],
-) -> None:
-    def _write():
-        i = 0
-        active_readers = set()
-        with ProcessPoolExecutor(max_workers=config["concurrent_reads"]) as executor:
-            for revision_maker in revision_iterator_functions:
-                while len(active_readers) >= config["concurrent_reads"]:
-                    completed_readers, active_readers = wait(
-                        active_readers, return_when=FIRST_COMPLETED, timeout=60
-                    )
-                    for future in completed_readers:
-                        i += future.result()
-                        print(f"{timestr()} wrote revision #{i}")
-                if output_filename is None:
-                    active_readers.add(
-                        executor.submit(
-                            _write_rows_to_pipe,
-                            config["pipe_dir"],
-                            revision_maker,
-                            FIELDS,
-                        )
-                    )
-                else:
-                    active_readers.add(
-                        executor.submit(
-                            _write_rows_to_bzipped_csv,
-                            revision_maker,
-                            output_filename,
-                            FIELDS,
-                            int(
-                                math.floor(
-                                    config["backlog"] / config["concurrent_reads"]
-                                )
-                            ),
-                        )
-                    )
-            while len(active_readers) > 0:
-                completed_readers, active_readers = wait(
-                    active_readers, return_when=FIRST_COMPLETED, timeout=120
-                )
-                for future in completed_readers:
-                    i += future.result()
-                    print(f"{timestr()} wrote revision #{i}")
+):
+    from wikipedia_revisions.write_to_files import write_to_csv as write
 
-    if output_filename is None:
-        _write()
-    else:
-        with bz2.open(output_filename, "wt", newline="") as out:
-            writer = csv.DictWriter(out, FIELDS)
-            writer.writeheader()
-        _write()
+    write(filename, revision_iterator_functions)
 
 
 def write_to_database(

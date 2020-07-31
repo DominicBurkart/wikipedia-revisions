@@ -34,7 +34,3 @@ jobs:
       run: |
         pip install black
         black wikipedia_revisions/*.py
-    - name: Test with pytest
-      run: |
-        pip install pytest
-        pytest wikipedia_revisions/*.py
