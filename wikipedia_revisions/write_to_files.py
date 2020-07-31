@@ -7,8 +7,10 @@ from concurrent.futures import ProcessPoolExecutor, wait, FIRST_COMPLETED
 from typing import Callable, Iterable, Dict, List, Optional
 import time
 
+import dill
+
 from wikipedia_revisions import config, FIELDS
-from wikipedia_revisions.utils import timestr
+from wikipedia_revisions.utils import timestr, run_dilled_function
 
 
 def _write_rows_to_pipe(
@@ -78,9 +80,8 @@ def write_to_csv(
     with ProcessPoolExecutor(max_workers=config["concurrent_reads"]) as executor:
         for revision_maker in revision_iterator_functions:
             if single_output_filename is not None:
-                active_readers.add(
-                    executor.submit(
-                        _write_rows_to_bzipped_csv,
+                dilled_function = dill.dumps(
+                    lambda: _write_rows_to_bzipped_csv(
                         revision_maker,
                         single_output_filename,
                         FIELDS,
@@ -88,15 +89,12 @@ def write_to_csv(
                     )
                 )
             else:
-                active_readers.add(
-                    executor.submit(
-                        _write_rows_to_pipe,
-                        config["pipe_dir"],
-                        revision_maker,
-                        FIELDS,
-                        backlog_per_process,
+                dilled_function = dill.dumps(
+                    lambda: _write_rows_to_pipe(
+                        config["pipe_dir"], revision_maker, FIELDS, backlog_per_process
                     )
                 )
+            active_readers.add(executor.submit(run_dilled_function, dilled_function))
 
             # when at capacity, wait for current readers to finish
             while len(active_readers) >= config["concurrent_reads"]:

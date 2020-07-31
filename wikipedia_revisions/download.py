@@ -259,7 +259,6 @@ def full_dump_url_from_partial(partial: str):
 
 
 def download_and_parse_files() -> Iterable[Callable[..., Generator[Dict, None, None]]]:
-    # todo automatically find the last completed bz2 history job
     print(f"{timestr()} requesting dump directory... 📚")
     session = requests.Session()
     session.headers.update(

@@ -17,9 +17,7 @@ from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, scoped_session
 from sqlalchemy_utils import database_exists, create_database, drop_database
 
-from wikipedia_revisions.utils import timestr
-
-dill.settings["recurse"] = True
+from wikipedia_revisions.utils import timestr, run_dilled_function
 
 SMALLBATCH = 50 * 1024 * 1024
 BIGBATCH = 500 * 1024 * 1024
@@ -111,18 +109,6 @@ def _multi_insert(Session, batch):
     _commit_wrapper(_commit)
 
 
-def _run_dilled_function(dilled_extractor_function: bytes):
-    try:
-        f = dill.loads(dilled_extractor_function)
-        res = f()
-        return res
-    except Exception as e:
-        import traceback
-
-        traceback.print_exc()
-        raise e
-
-
 def _run_one_extractor(extractor, config):
     engine = create_engine(
         config["database_url"], pool_size=config["num_db_connections"]
@@ -212,7 +198,7 @@ def write(
                     lambda: _run_one_extractor(revision_iterator_function, config)
                 )
                 active_extractor_futures.add(
-                    executor.submit(_run_dilled_function, dilled_extractor)
+                    executor.submit(run_dilled_function, dilled_extractor)
                 )
                 while len(active_extractor_futures) >= config["concurrent_reads"]:
                     try:

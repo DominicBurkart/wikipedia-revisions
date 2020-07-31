@@ -1,3 +1,7 @@
+import dill
+
+dill.settings["recurse"] = True
+
 config = dict()
 
 FIELDS = [
