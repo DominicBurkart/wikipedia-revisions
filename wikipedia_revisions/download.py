@@ -8,15 +8,13 @@ import threading
 import time
 import traceback
 import xml.etree.ElementTree as ET
-from concurrent.futures import ThreadPoolExecutor
-from queue import Queue
-from typing import Optional, Dict, Generator, Iterable, Tuple, Callable, Set
+from typing import Optional, Dict, Generator, Iterable, Callable, Set
 
 import click
 import requests
 
 from wikipedia_revisions import config
-from wikipedia_revisions.utils import timestr, peek_ahead
+from wikipedia_revisions.utils import timestr
 
 
 def download_bz2_file(session: requests.Session, url: str) -> str:
@@ -302,9 +300,7 @@ def write_to_csv(
 ):
     from wikipedia_revisions.write_to_files import write_to_csv as write
 
-    with ThreadPoolExecutor() as executor:
-        functions = peek_ahead(executor, revision_iterator_functions)
-        write(filename, functions)
+    write(filename, revision_iterator_functions)
 
 
 def write_to_database(
@@ -312,9 +308,7 @@ def write_to_database(
 ) -> None:
     from wikipedia_revisions.write_to_database import write
 
-    with ThreadPoolExecutor() as executor:
-        functions = peek_ahead(executor, revision_iterator_functions)
-        write(config, functions)
+    write(config, revision_iterator_functions)
 
 
 @click.command()
