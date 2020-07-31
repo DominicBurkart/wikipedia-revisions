@@ -288,21 +288,23 @@ def download_and_parse_files() -> Iterable[Callable[..., Generator[Dict, None, N
         )
     )
 
-    with ThreadPoolExecutor() as executor:
-        # download & verify history files
-        verified_files = peek_ahead(
-            executor, download_and_verify_bz2_files(session, bz2_urls)
-        )
+    # download & verify history files
+    verified_files = download_and_verify_bz2_files(session, bz2_urls)
 
-        # create functions that read and parse valid files
-        for filename in verified_files:
-            yield lambda: parse_one_file(filename)
+    # create functions that read and parse valid files
+    for filename in verified_files:
+        yield lambda: parse_one_file(filename)
 
 
-def write_to_csv(*args, **kwargs):
+def write_to_csv(
+    filename: Optional[str],
+    revision_iterator_functions: Iterable[Callable[..., Iterable[Dict]]],
+):
     from wikipedia_revisions.write_to_files import write_to_csv as write
 
-    write(*args, **kwargs)
+    with ThreadPoolExecutor() as executor:
+        functions = peek_ahead(executor, revision_iterator_functions)
+        write(filename, functions)
 
 
 def write_to_database(
@@ -310,7 +312,9 @@ def write_to_database(
 ) -> None:
     from wikipedia_revisions.write_to_database import write
 
-    write(config, revision_iterator_functions)
+    with ThreadPoolExecutor() as executor:
+        functions = peek_ahead(executor, revision_iterator_functions)
+        write(config, functions)
 
 
 @click.command()
