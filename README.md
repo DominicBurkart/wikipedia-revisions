@@ -67,29 +67,24 @@ for any of these commands, for example:
 pypy3 -m wikipedia_revisions.download --help
 ```
 
-Output all revisions into a giant bz2-zipped csv:
+Output all revisions into a giant bz2-zipped csv, using the dump from a specific date:
 ```shell 
-python3 -u -m wikipedia_revisions.download
-```
-
-Use a wikipedia dump from a specific date:
-```shell
 python3 -u -m wikipedia_revisions.download --date 20200101
 ```
 
 Output to a series of named pipes (posix-based systems only):
 ```shell
-python3 -u -m wikipedia_revisions.download --pipe-dir /path/to/dir
+python3 -u -m wikipedia_revisions.download --date 20200101 --pipe-dir /path/to/dir
 ```
 
 Output to postgres database named "wikipedia_revisions" waiting at localhost port 5432:
 ```shell
-python3 -u -m wikipedia_revisions.download --database
+python3 -u -m wikipedia_revisions.download --date 20200101 --database
 ```
 
 To set the database url:
 ```shell
-python3 -u -m wikipedia_revisions.download --database --database-url postgres://postgres@localhost:5432/wikipedia_revisions
+python3 -u -m wikipedia_revisions.download --date 20200101 --database --database-url postgres://postgres@localhost:5432/wikipedia_revisions
 ```
 
 Note: If using PyPy to write to a database, currently only postgres is 
