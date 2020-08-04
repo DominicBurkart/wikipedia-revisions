@@ -22,9 +22,9 @@ Revisions are output with the following fields:
 The id, timestamp, page_id, page_title, and page_ns cannot be null. All other fields may be null.
 
 System requirements:
-- 4gb memory (more is better)
+- 2gb memory (more is better; requirement varies widely based on configuration)
 - python 3 & pip pre-installed
-- large storage (varying by output)
+- large storage (requirement varies widely based on configuration)
 
 The storage needs for the output vary by format. Writing to a postgres 
 database will require tens of terabytes of storage, while writing to a 
