@@ -88,7 +88,7 @@ def generate_revisions(file) -> Generator[Dict, None, None]:
     TITLE_STR = prefixed("title")
     PAGE_STR = prefixed("page")
     REVISION_STR = prefixed("revision")
-    PARENT_ID_STR = prefixed("parent_id")
+    PARENT_ID_STR = prefixed("parentid")
     TIMESTAMP_STR = prefixed("timestamp")
     CONTRIBUTOR_STR = prefixed("contributor")
     IP_STR = prefixed("ip")
