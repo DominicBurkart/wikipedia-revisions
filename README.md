@@ -22,9 +22,9 @@ Revisions are output with the following fields:
 The id, timestamp, page_id, page_title, and page_ns cannot be null. All other fields may be null.
 
 System requirements:
-- 4gb memory (more is better)
+- 2gb memory (more is better; requirement varies widely based on configuration)
 - python 3 & pip pre-installed
-- large storage (varying by output)
+- large storage (requirement varies widely based on configuration)
 
 The storage needs for the output vary by format. Writing to a postgres 
 database will require tens of terabytes of storage, while writing to a 
@@ -67,29 +67,24 @@ for any of these commands, for example:
 pypy3 -m wikipedia_revisions.download --help
 ```
 
-Output all revisions into a giant bz2-zipped csv:
+Output all revisions into a giant bz2-zipped csv, using the dump from a specific date:
 ```shell 
-python3 -u -m wikipedia_revisions.download
-```
-
-Use a wikipedia dump from a specific date:
-```shell
 python3 -u -m wikipedia_revisions.download --date 20200101
 ```
 
 Output to a series of named pipes (posix-based systems only):
 ```shell
-python3 -u -m wikipedia_revisions.download --pipe-dir /path/to/dir
+python3 -u -m wikipedia_revisions.download --date 20200101 --pipe-dir /path/to/dir
 ```
 
 Output to postgres database named "wikipedia_revisions" waiting at localhost port 5432:
 ```shell
-python3 -u -m wikipedia_revisions.download --database
+python3 -u -m wikipedia_revisions.download --date 20200101 --database
 ```
 
 To set the database url:
 ```shell
-python3 -u -m wikipedia_revisions.download --database --database-url postgres://postgres@localhost:5432/wikipedia_revisions
+python3 -u -m wikipedia_revisions.download --date 20200101 --database --database-url postgres://postgres@localhost:5432/wikipedia_revisions
 ```
 
 Note: If using PyPy to write to a database, currently only postgres is 

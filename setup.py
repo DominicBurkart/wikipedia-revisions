@@ -5,7 +5,7 @@ setup(
     version="0.1",
     description="Download every wikipedia edit.",
     author="Dominic Burkart",
-    author_email="foomail@foo.com",
+    author_email="@DominicBurkart",
     packages=["wikipedia_revisions"],
     install_requires=[
         "requests==2.23.0",
