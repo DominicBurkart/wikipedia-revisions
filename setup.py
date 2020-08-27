@@ -7,6 +7,7 @@ setup(
     author="Dominic Burkart",
     author_email="@DominicBurkart",
     packages=["wikipedia_revisions"],
+    license="BSD-3-Clause",
     install_requires=[
         "requests==2.23.0",
         "click==7.1.1",
