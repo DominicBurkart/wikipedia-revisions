@@ -9,7 +9,7 @@ setup(
     packages=["wikipedia_revisions"],
     license="BSD-3-Clause",
     install_requires=[
-        "requests==2.23.0",
+        "requests==2.31.0",
         "click==7.1.1",
         "dill==0.3.1.1",
         "python-dateutil==2.8.1",
